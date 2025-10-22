@@ -1,182 +1,315 @@
+#!/usr/bin/env python3
 """
 Servicio de Notificaciones (NOTIF) - Sistema de Reservación UDP
 Puerto: 5008
+Protocolo SOA: NNNNNSSSSSDATOS
 """
+import socket
+import threading
+import json
 import os
-import sys
-sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
-from fastapi import FastAPI, HTTPException, Depends
-from sqlalchemy.orm import Session
-from pydantic import BaseModel
-from typing import List, Optional
+from dotenv import load_dotenv
+from sqlalchemy import create_engine, text
 from datetime import datetime
-import uvicorn
-import smtplib
-from email.mime.text import MIMEText
-from email.mime.multipart import MIMEMultipart
 
-from database.db_config import get_db, init_db
-from database.models import Notificacion, Reserva, Usuario
-from services.common.soa_protocol import SOAProtocol
+# Cargar variables de entorno
+load_dotenv('config.env')
 
-app = FastAPI(title="Servicio de Notificaciones - NOTIF")
-
-# Inicializar base de datos
-init_db()
-
-# Modelos Pydantic
-class NotificationSend(BaseModel):
-    tipo: str
-    reserva_id: int
-    usuario_id: int
-
-class TemplateConfig(BaseModel):
-    tipo: str
-    texto: str
-
-def send_email(to_email: str, subject: str, body: str) -> bool:
-    """Enviar email (simulado para este ejemplo)"""
-    try:
-        # En un sistema real, aquí configurarías SMTP
-        print(f"Enviando email a {to_email}")
-        print(f"Asunto: {subject}")
-        print(f"Contenido: {body}")
-        return True
-    except Exception as e:
-        print(f"Error enviando email: {e}")
-        return False
-
-@app.post("/notifications/send")
-async def send_notification(request: NotificationSend, db: Session = Depends(get_db)):
-    """Enviar notificación"""
-    try:
-        # Obtener datos de la reserva y usuario
-        reserva = db.query(Reserva).filter(Reserva.id_reserva == request.reserva_id).first()
-        if not reserva:
-            raise HTTPException(status_code=404, detail="Reserva no encontrada")
+class NotificationService:
+    """Servicio de Notificaciones según especificación SOA"""
+    
+    def __init__(self, host: str = "localhost", port: int = 5008):
+        self.host = host
+        self.port = port
+        self.running = False
+        self.server_socket = None
         
-        usuario = db.query(Usuario).filter(Usuario.id_usuario == request.usuario_id).first()
-        if not usuario:
-            raise HTTPException(status_code=404, detail="Usuario no encontrado")
+        # Configuración de base de datos
+        DATABASE_URL = os.getenv('DATABASE_URL', 'sqlite:///./reservas_udp.db')
+        self.engine = create_engine(DATABASE_URL)
         
-        # Generar contenido según tipo
-        if request.tipo == "aprobacion":
-            asunto = "Reserva Aprobada"
-            contenido = f"Hola {usuario.nombre},\n\nSu reserva para {reserva.espacio.nombre} ha sido aprobada.\n\nDetalles:\n- Fecha: {reserva.fecha_inicio}\n- Hora: {reserva.fecha_inicio.strftime('%H:%M')} - {reserva.fecha_fin.strftime('%H:%M')}\n\n¡Que disfrute su reserva!"
+        # Plantillas de notificación por defecto
+        self.default_templates = {
+            "aprobacion": "Su reserva ha sido aprobada. Detalles: {detalles}",
+            "rechazo": "Su reserva ha sido rechazada. Motivo: {motivo}",
+            "cancelacion": "Su reserva ha sido cancelada. Detalles: {detalles}",
+            "bloqueo": "Se ha aplicado un bloqueo que afecta su reserva. Detalles: {detalles}",
+            "recordatorio": "Recordatorio: Tiene una reserva programada para {fecha_hora}"
+        }
+    
+    def parse_message(self, message: str) -> tuple:
+        """Parsear mensaje según protocolo SOA"""
+        if len(message) < 10:
+            raise ValueError("Mensaje muy corto")
         
-        elif request.tipo == "rechazo":
-            asunto = "Reserva Rechazada"
-            contenido = f"Hola {usuario.nombre},\n\nSu reserva para {reserva.espacio.nombre} ha sido rechazada.\n\nDetalles:\n- Fecha: {reserva.fecha_inicio}\n- Motivo: {reserva.motivo or 'No especificado'}\n\nPor favor, intente con otro horario."
+        length_str = message[:5]
+        service_code = message[5:10].strip()
+        data_str = message[10:]
         
-        elif request.tipo == "cancelacion":
-            asunto = "Reserva Cancelada"
-            contenido = f"Hola {usuario.nombre},\n\nSu reserva para {reserva.espacio.nombre} ha sido cancelada.\n\nDetalles:\n- Fecha: {reserva.fecha_inicio}\n- Hora: {reserva.fecha_inicio.strftime('%H:%M')} - {reserva.fecha_fin.strftime('%H:%M')}\n\nSi necesita una nueva reserva, puede crear una nueva solicitud."
+        try:
+            data = json.loads(data_str) if data_str else {}
+            return service_code, data
+        except json.JSONDecodeError:
+            raise ValueError("Error al decodificar JSON")
+    
+    def format_response(self, service_code: str, data: any) -> str:
+        """Formatear respuesta según protocolo SOA"""
+        json_data = json.dumps(data, ensure_ascii=False)
+        service_code = service_code.ljust(5)[:5]
+        message = service_code + json_data
+        length_str = str(len(message)).zfill(5)
         
-        else:
-            raise HTTPException(status_code=400, detail="Tipo de notificación no válido")
-        
-        # Crear notificación en BD
-        notif = Notificacion(
-            tipo_notificacion=request.tipo,
-            destinatario_email=usuario.correo_institucional,
-            asunto=asunto,
-            contenido=contenido,
-            id_reserva=request.reserva_id
-        )
-        
-        db.add(notif)
-        db.commit()
-        db.refresh(notif)
-        
-        # Enviar email
-        email_sent = send_email(usuario.correo_institucional, asunto, contenido)
-        
-        # Actualizar estado de envío
-        notif.enviada = email_sent
-        notif.fecha_envio = datetime.now() if email_sent else None
-        db.commit()
-        
-        return {"enviado": email_sent, "email": usuario.correo_institucional}
-        
-    except Exception as e:
-        db.rollback()
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.post("/notifications/template")
-async def configure_template(template_data: TemplateConfig, db: Session = Depends(get_db)):
-    """Configurar plantilla de notificación"""
-    try:
-        # En un sistema real, aquí guardarías las plantillas en BD
-        # Para este ejemplo, simplemente confirmamos la configuración
-        return {"configurado": True}
-        
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.get("/notifications/pending")
-async def get_pending_notifications(db: Session = Depends(get_db)):
-    """Obtener notificaciones pendientes"""
-    try:
-        pending = db.query(Notificacion).filter(Notificacion.enviada == False).all()
-        return [
-            {
-                "id": notif.id_notificacion,
-                "tipo": notif.tipo_notificacion,
-                "destinatario": notif.destinatario_email,
-                "asunto": notif.asunto,
-                "fecha_creacion": notif.fecha_creacion
-            }
-            for notif in pending
-        ]
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-# Endpoint para el protocolo SOA
-@app.post("/soa/message")
-async def handle_soa_message(message: str):
-    """Manejar mensajes del protocolo SOA"""
-    try:
-        protocol = SOAProtocol()
-        service_code, data = protocol.parse_message(message)
-        
-        if service_code.strip() == "notif":
-            db = next(get_db())
+        return length_str + message
+    
+    def handle_send_notification(self, data: dict) -> dict:
+        """Enviar notificación"""
+        try:
+            tipo = data.get('tipo', '')
+            reserva_id = data.get('reserva', '')
+            usuario_id = data.get('usuario', '')
+            detalles = data.get('detalles', '')
             
-            if "send" in data and "tipo" in data["send"]:
-                # Enviar notificación
-                request = NotificationSend(
-                    tipo=data["send"]["tipo"],
-                    reserva_id=int(data["send"]["reserva"]),
-                    usuario_id=int(data["send"]["usuario"])
+            if not all([tipo, usuario_id]):
+                return {"error": "Tipo y usuario son requeridos"}
+            
+            with self.engine.connect() as conn:
+                # Obtener información del usuario
+                user_result = conn.execute(text("""
+                    SELECT correo_institucional, nombre FROM usuarios WHERE id_usuario = :user_id
+                """), {"user_id": usuario_id})
+                
+                user_row = user_result.fetchone()
+                if not user_row:
+                    return {"error": "Usuario no encontrado"}
+                
+                email = user_row[0]
+                nombre = user_row[1]
+                
+                # Obtener información de la reserva si se proporciona
+                reserva_info = ""
+                if reserva_id:
+                    reserva_result = conn.execute(text("""
+                        SELECT r.fecha_inicio, r.fecha_fin, e.nombre, r.motivo
+                        FROM reservas r
+                        JOIN espacios e ON r.id_espacio = e.id_espacio
+                        WHERE r.id_reserva = :reserva_id
+                    """), {"reserva_id": reserva_id})
+                    
+                    reserva_row = reserva_result.fetchone()
+                    if reserva_row:
+                        reserva_info = f"Espacio: {reserva_row[2]}, Fecha: {reserva_row[0]} - {reserva_row[1]}, Motivo: {reserva_row[3]}"
+                
+                # Obtener plantilla
+                template_result = conn.execute(text("""
+                    SELECT contenido FROM plantillas_notificacion WHERE tipo = :tipo
+                """), {"tipo": tipo})
+                
+                template_row = template_result.fetchone()
+                if template_row:
+                    template = template_row[0]
+                else:
+                    template = self.default_templates.get(tipo, "Notificación del sistema: {detalles}")
+                
+                # Formatear mensaje
+                mensaje = template.format(
+                    nombre=nombre,
+                    detalles=detalles or reserva_info,
+                    fecha_hora=reserva_info
                 )
-                result = await send_notification(request, db)
-                response_data = {"enviado": result["enviado"], "email": result["email"]}
+                
+                # Registrar notificación en la base de datos
+                conn.execute(text("""
+                    INSERT INTO notificaciones (usuario_id, tipo, mensaje, fecha_envio, estado)
+                    VALUES (:user_id, :tipo, :mensaje, :fecha_envio, 'enviada')
+                """), {
+                    "user_id": usuario_id,
+                    "tipo": tipo,
+                    "mensaje": mensaje,
+                    "fecha_envio": datetime.now()
+                })
+                
+                conn.commit()
+                
+                # En un sistema real, aquí se enviaría el email
+                # Por ahora solo simulamos el envío
+                print(f"[NOTIF] Email enviado a {email}: {mensaje}")
+                
+                return {
+                    "enviado": True,
+                    "email": email,
+                    "mensaje": mensaje
+                }
+                
+        except Exception as e:
+            return {"error": f"Error interno: {str(e)}"}
+    
+    def handle_set_template(self, data: dict) -> dict:
+        """Configurar plantilla de notificación"""
+        try:
+            tipo = data.get('tipo', '')
+            texto = data.get('texto', '')
             
-            elif "plantilla" in data and "tipo" in data["plantilla"]:
-                # Configurar plantilla
-                template_data = TemplateConfig(
-                    tipo=data["plantilla"]["tipo"],
-                    texto=data["plantilla"]["texto"]
-                )
-                result = await configure_template(template_data, db)
-                response_data = {"configurado": result["configurado"]}
+            if not all([tipo, texto]):
+                return {"error": "Tipo y texto son requeridos"}
             
+            valid_types = ['aprobacion', 'rechazo', 'cancelacion', 'bloqueo', 'recordatorio']
+            if tipo not in valid_types:
+                return {"error": f"Tipo inválido. Tipos válidos: {valid_types}"}
+            
+            with self.engine.connect() as conn:
+                # Verificar si la plantilla existe
+                template_result = conn.execute(text("""
+                    SELECT id FROM plantillas_notificacion WHERE tipo = :tipo
+                """), {"tipo": tipo})
+                
+                if template_result.fetchone():
+                    # Actualizar plantilla existente
+                    conn.execute(text("""
+                        UPDATE plantillas_notificacion SET contenido = :texto WHERE tipo = :tipo
+                    """), {"texto": texto, "tipo": tipo})
+                else:
+                    # Crear nueva plantilla
+                    conn.execute(text("""
+                        INSERT INTO plantillas_notificacion (tipo, contenido, fecha_creacion)
+                        VALUES (:tipo, :texto, :fecha_creacion)
+                    """), {
+                        "tipo": tipo,
+                        "texto": texto,
+                        "fecha_creacion": datetime.now()
+                    })
+                
+                conn.commit()
+                
+                return {"configurado": True}
+                
+        except Exception as e:
+            return {"error": f"Error interno: {str(e)}"}
+    
+    def handle_get_notifications(self, data: dict) -> dict:
+        """Obtener notificaciones de un usuario"""
+        try:
+            usuario_id = data.get('usuario', '')
+            
+            if not usuario_id:
+                return {"error": "ID de usuario es requerido"}
+            
+            with self.engine.connect() as conn:
+                result = conn.execute(text("""
+                    SELECT tipo, mensaje, fecha_envio, estado
+                    FROM notificaciones
+                    WHERE usuario_id = :user_id
+                    ORDER BY fecha_envio DESC
+                    LIMIT 50
+                """), {"user_id": usuario_id})
+                
+                notifications = []
+                for row in result:
+                    notifications.append({
+                        "tipo": row[0],
+                        "mensaje": row[1],
+                        "fecha_envio": row[2].isoformat(),
+                        "estado": row[3]
+                    })
+                
+                return notifications
+                
+        except Exception as e:
+            return {"error": f"Error interno: {str(e)}"}
+    
+    def process_message(self, message: str) -> str:
+        """Procesar mensaje recibido"""
+        try:
+            service_code, data = self.parse_message(message)
+            
+            if service_code != "notif":
+                return self.format_response("notif", {"error": "Servicio incorrecto"})
+            
+            # Determinar acción basada en los datos
+            if 'send' in data or ('tipo' in data and 'usuario' in data):
+                response = self.handle_send_notification(data)
+            elif 'plantilla' in data or ('tipo' in data and 'texto' in data):
+                response = self.handle_set_template(data)
+            elif 'getnotifications' in data or ('usuario' in data and 'action' in data and data['action'] == 'get'):
+                response = self.handle_get_notifications(data)
             else:
-                response_data = {"error": "Comando no reconocido"}
-        
-        else:
-            response_data = {"error": "Servicio no reconocido"}
-        
-        # Formatear respuesta según protocolo SOA
-        return protocol.format_message("notif", response_data)
-        
-    except Exception as e:
-        return SOAProtocol().format_message("notif", {"error": str(e)})
+                response = {"error": "Acción no reconocida"}
+            
+            return self.format_response("notif", response)
+            
+        except Exception as e:
+            return self.format_response("notif", {"error": str(e)})
+    
+    def handle_client(self, client_socket: socket.socket, address: tuple):
+        """Manejar cliente conectado"""
+        try:
+            print(f"[NOTIF] Conexión establecida desde {address}")
+            
+            while True:
+                # Recibir mensaje
+                message = client_socket.recv(4096).decode('utf-8')
+                if not message:
+                    break
+                
+                print(f"[NOTIF] Mensaje recibido: {message[:50]}...")
+                
+                # Procesar mensaje
+                response = self.process_message(message)
+                
+                # Enviar respuesta
+                client_socket.sendall(response.encode('utf-8'))
+                print(f"[NOTIF] Respuesta enviada: {response[:50]}...")
+                
+        except Exception as e:
+            print(f"[NOTIF] Error manejando cliente {address}: {e}")
+        finally:
+            client_socket.close()
+            print(f"[NOTIF] Conexión cerrada con {address}")
+    
+    def start(self):
+        """Iniciar servicio de notificaciones"""
+        try:
+            self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            self.server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            self.server_socket.bind((self.host, self.port))
+            self.server_socket.listen(5)
+            
+            self.running = True
+            print(f"[NOTIF] Servicio de Notificaciones iniciado en {self.host}:{self.port}")
+            
+            while self.running:
+                try:
+                    client_socket, address = self.server_socket.accept()
+                    client_thread = threading.Thread(
+                        target=self.handle_client,
+                        args=(client_socket, address)
+                    )
+                    client_thread.daemon = True
+                    client_thread.start()
+                    
+                except socket.error as e:
+                    if self.running:
+                        print(f"[NOTIF] Error aceptando conexión: {e}")
+                    
+        except Exception as e:
+            print(f"[NOTIF] Error iniciando servicio: {e}")
+        finally:
+            self.stop()
+    
+    def stop(self):
+        """Detener servicio de notificaciones"""
+        self.running = False
+        if self.server_socket:
+            self.server_socket.close()
+        print("[NOTIF] Servicio de Notificaciones detenido")
+
+def main():
+    """Función principal"""
+    service = NotificationService()
+    try:
+        service.start()
+    except KeyboardInterrupt:
+        print("\n[NOTIF] Deteniendo servicio...")
+        service.stop()
 
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=5008)
-
-
-
-
+    main()

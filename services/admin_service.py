@@ -1,213 +1,355 @@
+#!/usr/bin/env python3
 """
 Servicio de Administración (ADMIN) - Sistema de Reservación UDP
 Puerto: 5007
+Protocolo SOA: NNNNNSSSSSDATOS
 """
+import socket
+import threading
+import json
 import os
-import sys
-sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from dotenv import load_dotenv
+from sqlalchemy import create_engine, text
+from datetime import datetime
 
-from fastapi import FastAPI, HTTPException, Depends
-from sqlalchemy.orm import Session
-from pydantic import BaseModel
-from typing import List, Optional
-from datetime import datetime, date
-import uvicorn
+# Cargar variables de entorno
+load_dotenv('config.env')
 
-from database.db_config import get_db, init_db
-from database.models import Configuracion, Auditoria
-from services.common.soa_protocol import SOAProtocol
-
-app = FastAPI(title="Servicio de Administración - ADMIN")
-
-# Inicializar base de datos
-init_db()
-
-# Modelos Pydantic
-class ConfigUpdate(BaseModel):
-    ventana_anticipacion_dias: Optional[int] = None
-    max_reservas_usuario: Optional[int] = None
-    duracion_max_horas: Optional[int] = None
-    hora_inicio: Optional[str] = None
-    hora_fin: Optional[str] = None
-
-class ConfigResponse(BaseModel):
-    ventana_anticipacion_dias: int
-    max_reservas_usuario: int
-    duracion_max_horas: int
-    hora_inicio: str
-    hora_fin: str
-
-class AuditoriaResponse(BaseModel):
-    id: int
-    tabla_afectada: str
-    accion: str
-    id_registro: Optional[int]
-    fecha_accion: datetime
-    usuario_id: Optional[int]
-
-def log_audit(db: Session, tabla: str, accion: str, id_registro: int, datos_anteriores: dict, datos_nuevos: dict, id_usuario: int):
-    """Registrar acción en auditoría"""
-    audit = Auditoria(
-        tabla_afectada=tabla,
-        accion=accion,
-        id_registro=id_registro,
-        datos_anteriores=datos_anteriores,
-        datos_nuevos=datos_nuevos,
-        id_usuario=id_usuario
-    )
-    db.add(audit)
-    db.commit()
-
-@app.get("/admin/config", response_model=ConfigResponse)
-async def get_config(db: Session = Depends(get_db)):
-    """Obtener configuración actual"""
-    try:
-        config = db.query(Configuracion).first()
-        if not config:
-            # Crear configuración por defecto
-            config = Configuracion()
-            db.add(config)
-            db.commit()
-            db.refresh(config)
+class AdminService:
+    """Servicio de Administración según especificación SOA"""
+    
+    def __init__(self, host: str = "localhost", port: int = 5007):
+        self.host = host
+        self.port = port
+        self.running = False
+        self.server_socket = None
         
-        return ConfigResponse(
-            ventana_anticipacion_dias=config.ventana_anticipacion_dias,
-            max_reservas_usuario=config.max_reservas_usuario,
-            duracion_max_horas=config.duracion_max_horas,
-            hora_inicio=str(config.hora_inicio),
-            hora_fin=str(config.hora_fin)
-        )
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.put("/admin/config")
-async def update_config(config_data: ConfigUpdate, db: Session = Depends(get_db)):
-    """Actualizar configuración"""
-    try:
-        config = db.query(Configuracion).first()
-        if not config:
-            config = Configuracion()
-            db.add(config)
+        # Configuración de base de datos
+        DATABASE_URL = os.getenv('DATABASE_URL', 'sqlite:///./reservas_udp.db')
+        self.engine = create_engine(DATABASE_URL)
+    
+    def parse_message(self, message: str) -> tuple:
+        """Parsear mensaje según protocolo SOA"""
+        if len(message) < 10:
+            raise ValueError("Mensaje muy corto")
         
-        # Guardar datos anteriores para auditoría
-        datos_anteriores = {
-            "ventana_anticipacion_dias": config.ventana_anticipacion_dias,
-            "max_reservas_usuario": config.max_reservas_usuario,
-            "duracion_max_horas": config.duracion_max_horas,
-            "hora_inicio": str(config.hora_inicio),
-            "hora_fin": str(config.hora_fin)
-        }
+        length_str = message[:5]
+        service_code = message[5:10].strip()
+        data_str = message[10:]
         
-        # Actualizar configuración
-        if config_data.ventana_anticipacion_dias is not None:
-            config.ventana_anticipacion_dias = config_data.ventana_anticipacion_dias
-        if config_data.max_reservas_usuario is not None:
-            config.max_reservas_usuario = config_data.max_reservas_usuario
-        if config_data.duracion_max_horas is not None:
-            config.duracion_max_horas = config_data.duracion_max_horas
-        if config_data.hora_inicio is not None:
-            config.hora_inicio = config_data.hora_inicio
-        if config_data.hora_fin is not None:
-            config.hora_fin = config_data.hora_fin
+        try:
+            data = json.loads(data_str) if data_str else {}
+            return service_code, data
+        except json.JSONDecodeError:
+            raise ValueError("Error al decodificar JSON")
+    
+    def format_response(self, service_code: str, data: any) -> str:
+        """Formatear respuesta según protocolo SOA"""
+        json_data = json.dumps(data, ensure_ascii=False)
+        service_code = service_code.ljust(5)[:5]
+        message = service_code + json_data
+        length_str = str(len(message)).zfill(5)
         
-        config.fecha_actualizacion = datetime.now()
-        db.commit()
-        
-        # Registrar en auditoría
-        datos_nuevos = {
-            "ventana_anticipacion_dias": config.ventana_anticipacion_dias,
-            "max_reservas_usuario": config.max_reservas_usuario,
-            "duracion_max_horas": config.duracion_max_horas,
-            "hora_inicio": str(config.hora_inicio),
-            "hora_fin": str(config.hora_fin)
-        }
-        log_audit(db, "configuraciones", "actualizar", config.id_config, datos_anteriores, datos_nuevos, 1)
-        
-        return {"configurado": True}
-        
-    except Exception as e:
-        db.rollback()
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.get("/admin/audit", response_model=List[AuditoriaResponse])
-async def get_audit_log(fecha: Optional[str] = None, db: Session = Depends(get_db)):
-    """Obtener log de auditoría"""
-    try:
-        query = db.query(Auditoria)
-        
-        if fecha:
-            fecha_parseada = datetime.strptime(fecha, "%Y-%m-%d").date()
-            query = query.filter(Auditoria.fecha_accion >= fecha_parseada)
-        
-        audit_logs = query.order_by(Auditoria.fecha_accion.desc()).limit(100).all()
-        
-        return [
-            AuditoriaResponse(
-                id=log.id_auditoria,
-                tabla_afectada=log.tabla_afectada,
-                accion=log.accion,
-                id_registro=log.id_registro,
-                fecha_accion=log.fecha_accion,
-                usuario_id=log.id_usuario
-            )
-            for log in audit_logs
-        ]
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-# Endpoint para el protocolo SOA
-@app.post("/soa/message")
-async def handle_soa_message(message: str):
-    """Manejar mensajes del protocolo SOA"""
-    try:
-        protocol = SOAProtocol()
-        service_code, data = protocol.parse_message(message)
-        
-        if service_code.strip() == "admin":
-            db = next(get_db())
+        return length_str + message
+    
+    def handle_set_config(self, data: dict) -> dict:
+        """Configurar parámetros operativos"""
+        try:
+            ventana_anticipacion = data.get('ventana_anticipacion', '')
+            max_reservas = data.get('max_reservas', '')
+            duracion_max = data.get('duracion_max', '')
+            hora_inicio = data.get('hora_inicio', '')
+            hora_fin = data.get('hora_fin', '')
             
-            if "config" in data:
-                # Configurar parámetros
-                config_data = ConfigUpdate(**data["config"])
-                result = await update_config(config_data, db)
-                response_data = {"configurado": result["configurado"]}
+            if not any([ventana_anticipacion, max_reservas, duracion_max, hora_inicio, hora_fin]):
+                return {"error": "Al menos un parámetro debe ser proporcionado"}
             
-            elif "getconfig" in data:
-                # Consultar parámetros
-                result = await get_config(db)
-                response_data = {
-                    "ventana_anticipacion": result.ventana_anticipacion_dias,
-                    "max_reservas": result.max_reservas_usuario,
-                    "duracion_max": result.duracion_max_horas
-                }
-            
-            elif "getaudit" in data and "fecha" in data["getaudit"]:
-                # Consultar auditoría
-                results = await get_audit_log(data["getaudit"]["fecha"], db)
-                response_data = [
-                    {
-                        "accion": log.accion,
-                        "usuario": str(log.usuario_id),
-                        "fecha": log.fecha_accion.isoformat()
+            with self.engine.connect() as conn:
+                # Verificar si existe configuración
+                config_result = conn.execute(text("SELECT id_config FROM configuraciones LIMIT 1"))
+                config_exists = config_result.fetchone()
+                
+                if config_exists:
+                    # Actualizar configuración existente
+                    updates = []
+                    params = {}
+                    
+                    if ventana_anticipacion:
+                        updates.append("ventana_anticipacion_dias = :ventana_anticipacion")
+                        params["ventana_anticipacion"] = int(ventana_anticipacion)
+                    
+                    if max_reservas:
+                        updates.append("max_reservas_usuario = :max_reservas")
+                        params["max_reservas"] = int(max_reservas)
+                    
+                    if duracion_max:
+                        updates.append("duracion_max_horas = :duracion_max")
+                        params["duracion_max"] = int(duracion_max)
+                    
+                    if hora_inicio:
+                        updates.append("hora_inicio = :hora_inicio")
+                        params["hora_inicio"] = hora_inicio
+                    
+                    if hora_fin:
+                        updates.append("hora_fin = :hora_fin")
+                        params["hora_fin"] = hora_fin
+                    
+                    query = f"UPDATE configuraciones SET {', '.join(updates)}"
+                    conn.execute(text(query), params)
+                    
+                else:
+                    # Crear nueva configuración
+                    conn.execute(text("""
+                        INSERT INTO configuraciones (ventana_anticipacion_dias, max_reservas_usuario, 
+                                                  duracion_max_horas, hora_inicio, hora_fin)
+                        VALUES (:ventana_anticipacion, :max_reservas, :duracion_max, :hora_inicio, :hora_fin)
+                    """), {
+                        "ventana_anticipacion": int(ventana_anticipacion) if ventana_anticipacion else 7,
+                        "max_reservas": int(max_reservas) if max_reservas else 1,
+                        "duracion_max": int(duracion_max) if duracion_max else 4,
+                        "hora_inicio": hora_inicio if hora_inicio else "08:00",
+                        "hora_fin": hora_fin if hora_fin else "22:00"
+                    })
+                
+                conn.commit()
+                
+                return {"configurado": True}
+                
+        except Exception as e:
+            return {"error": f"Error interno: {str(e)}"}
+    
+    def handle_get_config(self, data: dict) -> dict:
+        """Obtener configuración actual"""
+        try:
+            with self.engine.connect() as conn:
+                result = conn.execute(text("""
+                    SELECT ventana_anticipacion_dias, max_reservas_usuario, 
+                           duracion_max_horas, hora_inicio, hora_fin
+                    FROM configuraciones LIMIT 1
+                """))
+                
+                config_row = result.fetchone()
+                
+                if config_row:
+                    return {
+                        "ventana_anticipacion": config_row[0],
+                        "max_reservas": config_row[1],
+                        "duracion_max": config_row[2],
+                        "hora_inicio": str(config_row[3]),
+                        "hora_fin": str(config_row[4])
                     }
-                    for log in results
-                ]
+                else:
+                    # Configuración por defecto
+                    return {
+                        "ventana_anticipacion": 7,
+                        "max_reservas": 1,
+                        "duracion_max": 4,
+                        "hora_inicio": "08:00",
+                        "hora_fin": "22:00"
+                    }
+                
+        except Exception as e:
+            return {"error": f"Error interno: {str(e)}"}
+    
+    def handle_get_audit(self, data: dict) -> dict:
+        """Obtener historial de auditoría"""
+        try:
+            fecha = data.get('fecha', '')
+            fecha_inicio = data.get('fecha_inicio', '')
+            fecha_fin = data.get('fecha_fin', '')
             
+            with self.engine.connect() as conn:
+                query = """
+                    SELECT accion, usuario_id, fecha_accion, detalles
+                    FROM auditoria
+                    WHERE 1=1
+                """
+                params = {}
+                
+                if fecha:
+                    query += " AND DATE(fecha_accion) = :fecha"
+                    params["fecha"] = fecha
+                elif fecha_inicio and fecha_fin:
+                    query += " AND fecha_accion BETWEEN :fecha_inicio AND :fecha_fin"
+                    params["fecha_inicio"] = fecha_inicio
+                    params["fecha_fin"] = fecha_fin
+                
+                query += " ORDER BY fecha_accion DESC LIMIT 100"
+                
+                result = conn.execute(text(query), params)
+                
+                audit_log = []
+                for row in result:
+                    audit_log.append({
+                        "accion": row[0],
+                        "usuario": row[1],
+                        "fecha": row[2].isoformat(),
+                        "detalles": row[3]
+                    })
+                
+                return audit_log
+                
+        except Exception as e:
+            return {"error": f"Error interno: {str(e)}"}
+    
+    def handle_get_stats(self, data: dict) -> dict:
+        """Obtener estadísticas del sistema"""
+        try:
+            with self.engine.connect() as conn:
+                # Estadísticas de usuarios
+                user_stats = conn.execute(text("""
+                    SELECT 
+                        COUNT(*) as total_usuarios,
+                        SUM(CASE WHEN activo = 1 THEN 1 ELSE 0 END) as usuarios_activos,
+                        SUM(CASE WHEN tipo_usuario = 'estudiante' THEN 1 ELSE 0 END) as estudiantes,
+                        SUM(CASE WHEN tipo_usuario = 'funcionario' THEN 1 ELSE 0 END) as funcionarios,
+                        SUM(CASE WHEN tipo_usuario = 'administrador' THEN 1 ELSE 0 END) as administradores
+                    FROM usuarios
+                """)).fetchone()
+                
+                # Estadísticas de espacios
+                space_stats = conn.execute(text("""
+                    SELECT 
+                        COUNT(*) as total_espacios,
+                        SUM(CASE WHEN activo = 1 THEN 1 ELSE 0 END) as espacios_activos,
+                        SUM(CASE WHEN tipo = 'sala' THEN 1 ELSE 0 END) as salas,
+                        SUM(CASE WHEN tipo = 'cancha' THEN 1 ELSE 0 END) as canchas
+                    FROM espacios
+                """)).fetchone()
+                
+                # Estadísticas de reservas
+                booking_stats = conn.execute(text("""
+                    SELECT 
+                        COUNT(*) as total_reservas,
+                        SUM(CASE WHEN estado = 'pendiente' THEN 1 ELSE 0 END) as pendientes,
+                        SUM(CASE WHEN estado = 'aprobada' THEN 1 ELSE 0 END) as aprobadas,
+                        SUM(CASE WHEN estado = 'rechazada' THEN 1 ELSE 0 END) as rechazadas,
+                        SUM(CASE WHEN estado = 'cancelada' THEN 1 ELSE 0 END) as canceladas
+                    FROM reservas
+                """)).fetchone()
+                
+                return {
+                    "usuarios": {
+                        "total": user_stats[0],
+                        "activos": user_stats[1],
+                        "estudiantes": user_stats[2],
+                        "funcionarios": user_stats[3],
+                        "administradores": user_stats[4]
+                    },
+                    "espacios": {
+                        "total": space_stats[0],
+                        "activos": space_stats[1],
+                        "salas": space_stats[2],
+                        "canchas": space_stats[3]
+                    },
+                    "reservas": {
+                        "total": booking_stats[0],
+                        "pendientes": booking_stats[1],
+                        "aprobadas": booking_stats[2],
+                        "rechazadas": booking_stats[3],
+                        "canceladas": booking_stats[4]
+                    }
+                }
+                
+        except Exception as e:
+            return {"error": f"Error interno: {str(e)}"}
+    
+    def process_message(self, message: str) -> str:
+        """Procesar mensaje recibido"""
+        try:
+            service_code, data = self.parse_message(message)
+            
+            if service_code != "admin":
+                return self.format_response("admin", {"error": "Servicio incorrecto"})
+            
+            # Determinar acción basada en los datos
+            if 'config' in data or any(key in data for key in ['ventana_anticipacion', 'max_reservas', 'duracion_max']):
+                response = self.handle_set_config(data)
+            elif 'getconfig' in data or data == {}:
+                response = self.handle_get_config(data)
+            elif 'getaudit' in data or 'fecha' in data:
+                response = self.handle_get_audit(data)
+            elif 'getstats' in data or 'stats' in data:
+                response = self.handle_get_stats(data)
             else:
-                response_data = {"error": "Comando no reconocido"}
-        
-        else:
-            response_data = {"error": "Servicio no reconocido"}
-        
-        # Formatear respuesta según protocolo SOA
-        return protocol.format_message("admin", response_data)
-        
-    except Exception as e:
-        return SOAProtocol().format_message("admin", {"error": str(e)})
+                response = {"error": "Acción no reconocida"}
+            
+            return self.format_response("admin", response)
+            
+        except Exception as e:
+            return self.format_response("admin", {"error": str(e)})
+    
+    def handle_client(self, client_socket: socket.socket, address: tuple):
+        """Manejar cliente conectado"""
+        try:
+            print(f"[ADMIN] Conexión establecida desde {address}")
+            
+            while True:
+                # Recibir mensaje
+                message = client_socket.recv(4096).decode('utf-8')
+                if not message:
+                    break
+                
+                print(f"[ADMIN] Mensaje recibido: {message[:50]}...")
+                
+                # Procesar mensaje
+                response = self.process_message(message)
+                
+                # Enviar respuesta
+                client_socket.sendall(response.encode('utf-8'))
+                print(f"[ADMIN] Respuesta enviada: {response[:50]}...")
+                
+        except Exception as e:
+            print(f"[ADMIN] Error manejando cliente {address}: {e}")
+        finally:
+            client_socket.close()
+            print(f"[ADMIN] Conexión cerrada con {address}")
+    
+    def start(self):
+        """Iniciar servicio de administración"""
+        try:
+            self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            self.server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            self.server_socket.bind((self.host, self.port))
+            self.server_socket.listen(5)
+            
+            self.running = True
+            print(f"[ADMIN] Servicio de Administración iniciado en {self.host}:{self.port}")
+            
+            while self.running:
+                try:
+                    client_socket, address = self.server_socket.accept()
+                    client_thread = threading.Thread(
+                        target=self.handle_client,
+                        args=(client_socket, address)
+                    )
+                    client_thread.daemon = True
+                    client_thread.start()
+                    
+                except socket.error as e:
+                    if self.running:
+                        print(f"[ADMIN] Error aceptando conexión: {e}")
+                    
+        except Exception as e:
+            print(f"[ADMIN] Error iniciando servicio: {e}")
+        finally:
+            self.stop()
+    
+    def stop(self):
+        """Detener servicio de administración"""
+        self.running = False
+        if self.server_socket:
+            self.server_socket.close()
+        print("[ADMIN] Servicio de Administración detenido")
+
+def main():
+    """Función principal"""
+    service = AdminService()
+    try:
+        service.start()
+    except KeyboardInterrupt:
+        print("\n[ADMIN] Deteniendo servicio...")
+        service.stop()
 
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=5007)
-
-
-
-
+    main()

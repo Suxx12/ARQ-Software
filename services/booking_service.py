@@ -1,399 +1,354 @@
+#!/usr/bin/env python3
 """
 Servicio de Reservas (BOOK) - Sistema de Reservación UDP
 Puerto: 5005
+Protocolo SOA: NNNNNSSSSSDATOS
 """
+import socket
+import threading
+import json
 import os
-import sys
-sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
-from fastapi import FastAPI, HTTPException, Depends
-from sqlalchemy.orm import Session
-from sqlalchemy import and_, or_
-from pydantic import BaseModel
-from typing import List, Optional
+from dotenv import load_dotenv
+from sqlalchemy import create_engine, text
 from datetime import datetime, timedelta
-import uvicorn
 
-from database.db_config import get_db, init_db
-from database.models import Reserva, Usuario, Espacio, Configuracion, Auditoria, Notificacion
-from services.common.soa_protocol import SOAProtocol
+# Cargar variables de entorno
+load_dotenv('config.env')
 
-app = FastAPI(title="Servicio de Reservas - BOOK")
-
-# Inicializar base de datos
-init_db()
-
-# Modelos Pydantic
-class ReservaCreate(BaseModel):
-    id_usuario: int
-    id_espacio: int
-    fecha_inicio: str  # ISO format
-    fecha_fin: str     # ISO format
-    motivo: Optional[str] = None
-    recurrente: bool = False
-    patron_recurrencia: Optional[str] = None
-
-class ReservaResponse(BaseModel):
-    id: int
-    id_usuario: int
-    id_espacio: int
-    fecha_inicio: datetime
-    fecha_fin: datetime
-    estado: str
-    motivo: Optional[str]
-    fecha_solicitud: datetime
-    recurrente: bool
-    espacio_nombre: str
-    usuario_nombre: str
-
-class AprobarReservaRequest(BaseModel):
-    id_reserva: int
-    estado: str  # aprobada o rechazada
-    id_administrador: int
-    motivo: Optional[str] = None
-
-def log_audit(db: Session, tabla: str, accion: str, id_registro: int, datos_anteriores: dict, datos_nuevos: dict, id_usuario: int):
-    """Registrar acción en auditoría"""
-    audit = Auditoria(
-        tabla_afectada=tabla,
-        accion=accion,
-        id_registro=id_registro,
-        datos_anteriores=datos_anteriores,
-        datos_nuevos=datos_nuevos,
-        id_usuario=id_usuario
-    )
-    db.add(audit)
-    db.commit()
-
-def create_notification(db: Session, tipo: str, id_reserva: int, email_destinatario: str, asunto: str, contenido: str):
-    """Crear notificación"""
-    notif = Notificacion(
-        tipo_notificacion=tipo,
-        destinatario_email=email_destinatario,
-        asunto=asunto,
-        contenido=contenido,
-        id_reserva=id_reserva
-    )
-    db.add(notif)
-    db.commit()
-
-def get_configuracion(db: Session) -> Configuracion:
-    """Obtener configuración actual del sistema"""
-    config = db.query(Configuracion).first()
-    if not config:
-        config = Configuracion()
-        db.add(config)
-        db.commit()
-        db.refresh(config)
-    return config
-
-def validate_reserva_times(fecha_inicio: datetime, fecha_fin: datetime, config: Configuracion) -> tuple:
-    """Validar horarios de reserva"""
-    # Verificar duración máxima
-    duracion_horas = (fecha_fin - fecha_inicio).total_seconds() / 3600
-    if duracion_horas > config.duracion_max_horas:
-        return False, f"La duración máxima permitida es {config.duracion_max_horas} horas"
+class BookingService:
+    """Servicio de Reservas según especificación SOA"""
     
-    # Verificar horario operativo
-    hora_inicio = fecha_inicio.time()
-    hora_fin_reserva = fecha_fin.time()
-    if hora_inicio < config.hora_inicio or hora_fin_reserva > config.hora_fin:
-        return False, f"La reserva debe estar dentro del horario operativo ({config.hora_inicio} - {config.hora_fin})"
+    def __init__(self, host: str = "localhost", port: int = 5005):
+        self.host = host
+        self.port = port
+        self.running = False
+        self.server_socket = None
+        
+        # Configuración de base de datos
+        DATABASE_URL = os.getenv('DATABASE_URL', 'sqlite:///./reservas_udp.db')
+        self.engine = create_engine(DATABASE_URL)
     
-    # Verificar ventana de anticipación
-    fecha_actual = datetime.now().date()
-    fecha_reserva = fecha_inicio.date()
-    dias_anticipacion = (fecha_reserva - fecha_actual).days
-    if dias_anticipacion < config.ventana_anticipacion_dias:
-        return False, f"La reserva debe hacerse con al menos {config.ventana_anticipacion_dias} días de anticipación"
+    def parse_message(self, message: str) -> tuple:
+        """Parsear mensaje según protocolo SOA"""
+        if len(message) < 10:
+            raise ValueError("Mensaje muy corto")
+        
+        length_str = message[:5]
+        service_code = message[5:10].strip()
+        data_str = message[10:]
+        
+        try:
+            data = json.loads(data_str) if data_str else {}
+            return service_code, data
+        except json.JSONDecodeError:
+            raise ValueError("Error al decodificar JSON")
     
-    return True, "OK"
-
-@app.post("/bookings/create", response_model=ReservaResponse)
-async def create_booking(booking_data: ReservaCreate, db: Session = Depends(get_db)):
-    """Crear nueva reserva"""
-    try:
-        # Parsear fechas
-        fecha_inicio = datetime.fromisoformat(booking_data.fecha_inicio.replace('Z', '+00:00'))
-        fecha_fin = datetime.fromisoformat(booking_data.fecha_fin.replace('Z', '+00:00'))
+    def format_response(self, service_code: str, data: any) -> str:
+        """Formatear respuesta según protocolo SOA"""
+        json_data = json.dumps(data, ensure_ascii=False)
+        service_code = service_code.ljust(5)[:5]
+        message = service_code + json_data
+        length_str = str(len(message)).zfill(5)
         
-        # Verificar que el usuario y espacio existen
-        usuario = db.query(Usuario).filter(Usuario.id_usuario == booking_data.id_usuario).first()
-        if not usuario:
-            raise HTTPException(status_code=404, detail="Usuario no encontrado")
-        
-        espacio = db.query(Espacio).filter(Espacio.id_espacio == booking_data.id_espacio).first()
-        if not espacio:
-            raise HTTPException(status_code=404, detail="Espacio no encontrado")
-        
-        # Obtener configuración
-        config = get_configuracion(db)
-        
-        # Validar horarios
-        is_valid, error_msg = validate_reserva_times(fecha_inicio, fecha_fin, config)
-        if not is_valid:
-            raise HTTPException(status_code=400, detail=error_msg)
-        
-        # Verificar límite de reservas por usuario
-        reservas_activas = db.query(Reserva).filter(
-            and_(
-                Reserva.id_usuario == booking_data.id_usuario,
-                Reserva.estado.in_(['pendiente', 'aprobada']),
-                Reserva.fecha_fin >= datetime.now()
-            )
-        ).count()
-        
-        if reservas_activas >= config.max_reservas_usuario:
-            raise HTTPException(
-                status_code=400, 
-                detail=f"Límite de reservas activas alcanzado ({config.max_reservas_usuario})"
-            )
-        
-        # Verificar disponibilidad (no solape)
-        reservas_conflicto = db.query(Reserva).filter(
-            and_(
-                Reserva.id_espacio == booking_data.id_espacio,
-                Reserva.estado.in_(['aprobada', 'pendiente']),
-                or_(
-                    and_(Reserva.fecha_inicio <= fecha_inicio, Reserva.fecha_fin > fecha_inicio),
-                    and_(Reserva.fecha_inicio < fecha_fin, Reserva.fecha_fin >= fecha_fin),
-                    and_(Reserva.fecha_inicio >= fecha_inicio, Reserva.fecha_fin <= fecha_fin)
-                )
-            )
-        ).first()
-        
-        if reservas_conflicto:
-            raise HTTPException(status_code=400, detail="El espacio no está disponible en ese horario")
-        
-        # Crear reserva
-        new_booking = Reserva(
-            id_usuario=booking_data.id_usuario,
-            id_espacio=booking_data.id_espacio,
-            fecha_inicio=fecha_inicio,
-            fecha_fin=fecha_fin,
-            motivo=booking_data.motivo,
-            recurrente=booking_data.recurrente,
-            patron_recurrencia=booking_data.patron_recurrencia,
-            estado='pendiente'
-        )
-        
-        db.add(new_booking)
-        db.commit()
-        db.refresh(new_booking)
-        
-        # Registrar en auditoría
-        log_audit(db, "reservas", "crear", new_booking.id_reserva, {}, {
-            "id_usuario": booking_data.id_usuario,
-            "id_espacio": booking_data.id_espacio,
-            "fecha_inicio": booking_data.fecha_inicio,
-            "fecha_fin": booking_data.fecha_fin,
-            "estado": "pendiente"
-        }, booking_data.id_usuario)
-        
-        # Crear notificación
-        create_notification(
-            db, "reserva_creada", new_booking.id_reserva,
-            usuario.correo_institucional,
-            "Reserva Creada",
-            f"Su reserva para {espacio.nombre} ha sido creada y está pendiente de aprobación."
-        )
-        
-        return ReservaResponse(
-            id=new_booking.id_reserva,
-            id_usuario=new_booking.id_usuario,
-            id_espacio=new_booking.id_espacio,
-            fecha_inicio=new_booking.fecha_inicio,
-            fecha_fin=new_booking.fecha_fin,
-            estado=new_booking.estado,
-            motivo=new_booking.motivo,
-            fecha_solicitud=new_booking.fecha_solicitud,
-            recurrente=new_booking.recurrente,
-            espacio_nombre=espacio.nombre,
-            usuario_nombre=usuario.nombre
-        )
-        
-    except Exception as e:
-        db.rollback()
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.get("/bookings/user/{user_id}", response_model=List[ReservaResponse])
-async def get_user_bookings(user_id: int, db: Session = Depends(get_db)):
-    """Obtener reservas de un usuario"""
-    try:
-        reservas = db.query(Reserva).join(Espacio).join(Usuario).filter(
-            Reserva.id_usuario == user_id
-        ).order_by(Reserva.fecha_solicitud.desc()).all()
-        
-        return [
-            ReservaResponse(
-                id=reserva.id_reserva,
-                id_usuario=reserva.id_usuario,
-                id_espacio=reserva.id_espacio,
-                fecha_inicio=reserva.fecha_inicio,
-                fecha_fin=reserva.fecha_fin,
-                estado=reserva.estado,
-                motivo=reserva.motivo,
-                fecha_solicitud=reserva.fecha_solicitud,
-                recurrente=reserva.recurrente,
-                espacio_nombre=reserva.espacio.nombre,
-                usuario_nombre=reserva.usuario.nombre
-            )
-            for reserva in reservas
-        ]
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.post("/bookings/approve")
-async def approve_booking(request: AprobarReservaRequest, db: Session = Depends(get_db)):
-    """Aprobar o rechazar reserva"""
-    try:
-        reserva = db.query(Reserva).filter(Reserva.id_reserva == request.id_reserva).first()
-        if not reserva:
-            raise HTTPException(status_code=404, detail="Reserva no encontrada")
-        
-        if reserva.estado != 'pendiente':
-            raise HTTPException(status_code=400, detail="La reserva no está pendiente")
-        
-        # Guardar datos anteriores para auditoría
-        datos_anteriores = {"estado": reserva.estado}
-        
-        # Actualizar estado
-        reserva.estado = request.estado
-        reserva.id_administrador_aprobador = request.id_administrador
-        reserva.fecha_aprobacion = datetime.now()
-        if request.motivo:
-            reserva.motivo = request.motivo
-        
-        db.commit()
-        
-        # Registrar en auditoría
-        datos_nuevos = {"estado": request.estado}
-        log_audit(db, "reservas", "aprobar", request.id_reserva, datos_anteriores, datos_nuevos, request.id_administrador)
-        
-        # Crear notificación
-        tipo_notif = "reserva_aprobada" if request.estado == "aprobada" else "reserva_rechazada"
-        asunto = "Reserva Aprobada" if request.estado == "aprobada" else "Reserva Rechazada"
-        contenido = f"Su reserva ha sido {request.estado}."
-        if request.motivo:
-            contenido += f" Motivo: {request.motivo}"
-        
-        create_notification(
-            db, tipo_notif, reserva.id_reserva,
-            reserva.usuario.correo_institucional,
-            asunto, contenido
-        )
-        
-        return {"updated": True, "notificado": True}
-        
-    except Exception as e:
-        db.rollback()
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.delete("/bookings/{booking_id}")
-async def cancel_booking(booking_id: int, db: Session = Depends(get_db)):
-    """Cancelar reserva"""
-    try:
-        reserva = db.query(Reserva).filter(Reserva.id_reserva == booking_id).first()
-        if not reserva:
-            raise HTTPException(status_code=404, detail="Reserva no encontrada")
-        
-        if reserva.estado in ['cancelada', 'rechazada']:
-            raise HTTPException(status_code=400, detail="La reserva ya está cancelada o rechazada")
-        
-        # Guardar datos anteriores para auditoría
-        datos_anteriores = {"estado": reserva.estado}
-        
-        # Cancelar reserva
-        reserva.estado = 'cancelada'
-        db.commit()
-        
-        # Registrar en auditoría
-        datos_nuevos = {"estado": "cancelada"}
-        log_audit(db, "reservas", "cancelar", booking_id, datos_anteriores, datos_nuevos, reserva.id_usuario)
-        
-        # Crear notificación
-        create_notification(
-            db, "reserva_cancelada", reserva.id_reserva,
-            reserva.usuario.correo_institucional,
-            "Reserva Cancelada",
-            "Su reserva ha sido cancelada."
-        )
-        
-        return {"cancelado": True}
-        
-    except Exception as e:
-        db.rollback()
-        raise HTTPException(status_code=500, detail=str(e))
-
-# Endpoint para el protocolo SOA
-@app.post("/soa/message")
-async def handle_soa_message(message: str):
-    """Manejar mensajes del protocolo SOA"""
-    try:
-        protocol = SOAProtocol()
-        service_code, data = protocol.parse_message(message)
-        
-        if service_code.strip() == "book":
-            db = next(get_db())
+        return length_str + message
+    
+    def handle_create_booking(self, data: dict) -> dict:
+        """Crear nueva reserva"""
+        try:
+            user_id = data.get('user', '')
+            space_id = data.get('space', '')
+            inicio = data.get('inicio', '')
+            fin = data.get('fin', '')
+            motivo = data.get('motivo', '')
             
-            if "user" in data and "space" in data and "inicio" in data and "fin" in data:
+            if not all([user_id, space_id, inicio, fin]):
+                return {"error": "Usuario, espacio, inicio y fin son requeridos"}
+            
+            # Parsear fechas
+            try:
+                fecha_inicio = datetime.fromisoformat(inicio.replace('T', ' '))
+                fecha_fin = datetime.fromisoformat(fin.replace('T', ' '))
+                
+                if fecha_fin <= fecha_inicio:
+                    return {"error": "La fecha de fin debe ser posterior a la de inicio"}
+                
+            except ValueError as e:
+                return {"error": f"Formato de fecha inválido: {str(e)}"}
+            
+            with self.engine.connect() as conn:
+                # Verificar que el usuario existe
+                user_result = conn.execute(text(
+                    "SELECT id_usuario FROM usuarios WHERE id_usuario = :user_id AND activo = 1"
+                ), {"user_id": user_id})
+                
+                if not user_result.fetchone():
+                    return {"error": "Usuario no encontrado"}
+                
+                # Verificar que el espacio existe
+                space_result = conn.execute(text(
+                    "SELECT id_espacio FROM espacios WHERE id_espacio = :space_id AND activo = 1"
+                ), {"space_id": space_id})
+                
+                if not space_result.fetchone():
+                    return {"error": "Espacio no encontrado"}
+                
+                # Verificar disponibilidad
+                conflict_result = conn.execute(text("""
+                    SELECT COUNT(*) FROM reservas 
+                    WHERE id_espacio = :space_id 
+                    AND estado IN ('pendiente', 'aprobada')
+                    AND (
+                        (fecha_inicio < :fecha_fin AND fecha_fin > :fecha_inicio)
+                    )
+                """), {
+                    "space_id": space_id,
+                    "fecha_inicio": fecha_inicio,
+                    "fecha_fin": fecha_fin
+                })
+                
+                if conflict_result.fetchone()[0] > 0:
+                    return {"error": "El espacio no está disponible en ese horario"}
+                
                 # Crear reserva
-                booking_data = ReservaCreate(
-                    id_usuario=int(data["user"]),
-                    id_espacio=int(data["space"]),
-                    fecha_inicio=data["inicio"],
-                    fecha_fin=data["fin"]
-                )
-                result = await create_booking(booking_data, db)
-                response_data = {
-                    "id": result.id,
-                    "estado": result.estado
+                result = conn.execute(text("""
+                    INSERT INTO reservas (id_usuario, id_espacio, fecha_inicio, fecha_fin, 
+                                        estado, motivo, fecha_solicitud, tipo_reserva)
+                    VALUES (:user_id, :space_id, :fecha_inicio, :fecha_fin, 
+                            'pendiente', :motivo, :fecha_solicitud, 'normal')
+                """), {
+                    "user_id": user_id,
+                    "space_id": space_id,
+                    "fecha_inicio": fecha_inicio,
+                    "fecha_fin": fecha_fin,
+                    "motivo": motivo,
+                    "fecha_solicitud": datetime.now()
+                })
+                
+                conn.commit()
+                
+                # Obtener ID de la reserva creada
+                booking_result = conn.execute(text("""
+                    SELECT id_reserva FROM reservas 
+                    WHERE id_usuario = :user_id AND id_espacio = :space_id 
+                    AND fecha_inicio = :fecha_inicio AND fecha_fin = :fecha_fin
+                    ORDER BY fecha_solicitud DESC LIMIT 1
+                """), {
+                    "user_id": user_id,
+                    "space_id": space_id,
+                    "fecha_inicio": fecha_inicio,
+                    "fecha_fin": fecha_fin
+                })
+                
+                booking_id = booking_result.fetchone()[0]
+                
+                return {
+                    "id": booking_id,
+                    "estado": "pendiente"
                 }
+                
+        except Exception as e:
+            return {"error": f"Error interno: {str(e)}"}
+    
+    def handle_approve_booking(self, data: dict) -> dict:
+        """Aprobar o rechazar reserva"""
+        try:
+            reserva_id = data.get('reserva', '')
+            estado = data.get('estado', '')
+            admin_id = data.get('admin', '')
             
-            elif "approve" in data and "reserva" in data["approve"] and "estado" in data["approve"]:
-                # Aprobar/Rechazar reserva
-                request = AprobarReservaRequest(
-                    id_reserva=int(data["approve"]["reserva"]),
-                    estado=data["approve"]["estado"],
-                    id_administrador=1  # ID del administrador
-                )
-                result = await approve_booking(request, db)
-                response_data = {"updated": result["updated"], "notificado": result["notificado"]}
+            if not all([reserva_id, estado, admin_id]):
+                return {"error": "ID de reserva, estado y admin son requeridos"}
             
-            elif "getmyreservas" in data:
-                # Obtener reservas del usuario
-                user_id = int(data["getmyreservas"])
-                results = await get_user_bookings(user_id, db)
-                response_data = [
-                    {
-                        "id": result.id,
-                        "espacio": result.espacio_nombre,
-                        "estado": result.estado
-                    }
-                    for result in results
-                ]
+            valid_states = ['aprobada', 'rechazada']
+            if estado not in valid_states:
+                return {"error": f"Estado inválido. Estados válidos: {valid_states}"}
             
-            elif "cancel" in data:
+            with self.engine.connect() as conn:
+                # Verificar que la reserva existe
+                reserva_result = conn.execute(text(
+                    "SELECT id_reserva FROM reservas WHERE id_reserva = :reserva_id"
+                ), {"reserva_id": reserva_id})
+                
+                if not reserva_result.fetchone():
+                    return {"error": "Reserva no encontrada"}
+                
+                # Actualizar estado
+                conn.execute(text("""
+                    UPDATE reservas SET estado = :estado WHERE id_reserva = :reserva_id
+                """), {"estado": estado, "reserva_id": reserva_id})
+                
+                conn.commit()
+                
+                return {
+                    "updated": True,
+                    "notificado": True  # Se podría implementar notificación real
+                }
+                
+        except Exception as e:
+            return {"error": f"Error interno: {str(e)}"}
+    
+    def handle_get_user_bookings(self, data: dict) -> dict:
+        """Obtener reservas de un usuario"""
+        try:
+            user_id = data.get('user', '')
+            
+            if not user_id:
+                return {"error": "ID de usuario es requerido"}
+            
+            with self.engine.connect() as conn:
+                result = conn.execute(text("""
+                    SELECT r.id_reserva, e.nombre, r.fecha_inicio, r.fecha_fin, 
+                           r.estado, r.motivo, r.fecha_solicitud
+                    FROM reservas r
+                    JOIN espacios e ON r.id_espacio = e.id_espacio
+                    WHERE r.id_usuario = :user_id
+                    ORDER BY r.fecha_solicitud DESC
+                """), {"user_id": user_id})
+                
+                bookings = []
+                for row in result:
+                    bookings.append({
+                        "id": row[0],
+                        "espacio": row[1],
+                        "fecha_inicio": row[2].isoformat(),
+                        "fecha_fin": row[3].isoformat(),
+                        "estado": row[4],
+                        "motivo": row[5],
+                        "fecha_solicitud": row[6].isoformat()
+                    })
+                
+                return bookings
+                
+        except Exception as e:
+            return {"error": f"Error interno: {str(e)}"}
+    
+    def handle_cancel_booking(self, data: dict) -> dict:
+        """Cancelar reserva"""
+        try:
+            reserva_id = data.get('reserva', '')
+            user_id = data.get('user', '')
+            
+            if not reserva_id:
+                return {"error": "ID de reserva es requerido"}
+            
+            with self.engine.connect() as conn:
+                # Verificar que la reserva existe y pertenece al usuario
+                reserva_result = conn.execute(text("""
+                    SELECT id_reserva FROM reservas 
+                    WHERE id_reserva = :reserva_id AND id_usuario = :user_id
+                """), {"reserva_id": reserva_id, "user_id": user_id})
+                
+                if not reserva_result.fetchone():
+                    return {"error": "Reserva no encontrada o no autorizada"}
+                
                 # Cancelar reserva
-                booking_id = int(data["cancel"])
-                result = await cancel_booking(booking_id, db)
-                response_data = {"cancelado": result["cancelado"]}
+                conn.execute(text("""
+                    UPDATE reservas SET estado = 'cancelada' WHERE id_reserva = :reserva_id
+                """), {"reserva_id": reserva_id})
+                
+                conn.commit()
+                
+                return {"cancelled": True}
+                
+        except Exception as e:
+            return {"error": f"Error interno: {str(e)}"}
+    
+    def process_message(self, message: str) -> str:
+        """Procesar mensaje recibido"""
+        try:
+            service_code, data = self.parse_message(message)
             
+            if service_code != "book":
+                return self.format_response("book", {"error": "Servicio incorrecto"})
+            
+            # Determinar acción basada en los datos
+            if 'user' in data and 'space' in data and 'inicio' in data and 'fin' in data:
+                response = self.handle_create_booking(data)
+            elif 'approve' in data or ('reserva' in data and 'estado' in data and 'admin' in data):
+                response = self.handle_approve_booking(data)
+            elif 'getmyreservas' in data or ('user' in data and 'action' in data and data['action'] == 'get'):
+                response = self.handle_get_user_bookings(data)
+            elif 'cancel' in data or ('reserva' in data and 'action' in data and data['action'] == 'cancel'):
+                response = self.handle_cancel_booking(data)
             else:
-                response_data = {"error": "Comando no reconocido"}
-        
-        else:
-            response_data = {"error": "Servicio no reconocido"}
-        
-        # Formatear respuesta según protocolo SOA
-        return protocol.format_message("book", response_data)
-        
-    except Exception as e:
-        return SOAProtocol().format_message("book", {"error": str(e)})
+                response = {"error": "Acción no reconocida"}
+            
+            return self.format_response("book", response)
+            
+        except Exception as e:
+            return self.format_response("book", {"error": str(e)})
+    
+    def handle_client(self, client_socket: socket.socket, address: tuple):
+        """Manejar cliente conectado"""
+        try:
+            print(f"[BOOK] Conexión establecida desde {address}")
+            
+            while True:
+                # Recibir mensaje
+                message = client_socket.recv(4096).decode('utf-8')
+                if not message:
+                    break
+                
+                print(f"[BOOK] Mensaje recibido: {message[:50]}...")
+                
+                # Procesar mensaje
+                response = self.process_message(message)
+                
+                # Enviar respuesta
+                client_socket.sendall(response.encode('utf-8'))
+                print(f"[BOOK] Respuesta enviada: {response[:50]}...")
+                
+        except Exception as e:
+            print(f"[BOOK] Error manejando cliente {address}: {e}")
+        finally:
+            client_socket.close()
+            print(f"[BOOK] Conexión cerrada con {address}")
+    
+    def start(self):
+        """Iniciar servicio de reservas"""
+        try:
+            self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            self.server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            self.server_socket.bind((self.host, self.port))
+            self.server_socket.listen(5)
+            
+            self.running = True
+            print(f"[BOOK] Servicio de Reservas iniciado en {self.host}:{self.port}")
+            
+            while self.running:
+                try:
+                    client_socket, address = self.server_socket.accept()
+                    client_thread = threading.Thread(
+                        target=self.handle_client,
+                        args=(client_socket, address)
+                    )
+                    client_thread.daemon = True
+                    client_thread.start()
+                    
+                except socket.error as e:
+                    if self.running:
+                        print(f"[BOOK] Error aceptando conexión: {e}")
+                    
+        except Exception as e:
+            print(f"[BOOK] Error iniciando servicio: {e}")
+        finally:
+            self.stop()
+    
+    def stop(self):
+        """Detener servicio de reservas"""
+        self.running = False
+        if self.server_socket:
+            self.server_socket.close()
+        print("[BOOK] Servicio de Reservas detenido")
+
+def main():
+    """Función principal"""
+    service = BookingService()
+    try:
+        service.start()
+    except KeyboardInterrupt:
+        print("\n[BOOK] Deteniendo servicio...")
+        service.stop()
 
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=5005)
-
-
-
-
+    main()

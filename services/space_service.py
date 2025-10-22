@@ -1,290 +1,307 @@
+#!/usr/bin/env python3
 """
 Servicio de Espacios (SPACE) - Sistema de Reservación UDP
 Puerto: 5003
+Protocolo SOA: NNNNNSSSSSDATOS
 """
+import socket
+import threading
+import json
 import os
-import sys
-sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
-from fastapi import FastAPI, HTTPException, Depends
-from sqlalchemy.orm import Session
-from pydantic import BaseModel
-from typing import List, Optional
-import uvicorn
-
-from database.db_config import get_db, init_db
-from database.models import Espacio, Auditoria
-from services.common.soa_protocol import SOAProtocol
+from dotenv import load_dotenv
+from sqlalchemy import create_engine, text
 from datetime import datetime
 
-app = FastAPI(title="Servicio de Espacios - SPACE")
+# Cargar variables de entorno
+load_dotenv('config.env')
 
-# Inicializar base de datos
-init_db()
-
-# Modelos Pydantic
-class EspacioCreate(BaseModel):
-    nombre: str
-    tipo: str  # sala o cancha
-    capacidad: int
-
-class EspacioUpdate(BaseModel):
-    nombre: Optional[str] = None
-    tipo: Optional[str] = None
-    capacidad: Optional[int] = None
-    activo: Optional[bool] = None
-
-class EspacioResponse(BaseModel):
-    id: int
-    nombre: str
-    tipo: str
-    capacidad: int
-    activo: bool
-    fecha_creacion: datetime
-
-def log_audit(db: Session, tabla: str, accion: str, id_registro: int, datos_anteriores: dict, datos_nuevos: dict, id_usuario: int):
-    """Registrar acción en auditoría"""
-    audit = Auditoria(
-        tabla_afectada=tabla,
-        accion=accion,
-        id_registro=id_registro,
-        datos_anteriores=datos_anteriores,
-        datos_nuevos=datos_nuevos,
-        id_usuario=id_usuario
-    )
-    db.add(audit)
-    db.commit()
-
-@app.post("/spaces/create", response_model=EspacioResponse)
-async def create_space(space_data: EspacioCreate, db: Session = Depends(get_db)):
-    """Crear nuevo espacio"""
-    try:
-        # Validar tipo de espacio
-        if space_data.tipo not in ['sala', 'cancha']:
-            raise HTTPException(status_code=400, detail="Tipo de espacio debe ser 'sala' o 'cancha'")
+class SpaceService:
+    """Servicio de Espacios según especificación SOA"""
+    
+    def __init__(self, host: str = "localhost", port: int = 5003):
+        self.host = host
+        self.port = port
+        self.running = False
+        self.server_socket = None
         
-        # Verificar si ya existe un espacio con el mismo nombre
-        existing_space = db.query(Espacio).filter(Espacio.nombre == space_data.nombre).first()
-        if existing_space:
-            raise HTTPException(status_code=400, detail="Ya existe un espacio con ese nombre")
+        # Configuración de base de datos
+        DATABASE_URL = os.getenv('DATABASE_URL', 'sqlite:///./reservas_udp.db')
+        self.engine = create_engine(DATABASE_URL)
+    
+    def parse_message(self, message: str) -> tuple:
+        """Parsear mensaje según protocolo SOA"""
+        if len(message) < 10:
+            raise ValueError("Mensaje muy corto")
         
-        # Crear nuevo espacio
-        new_space = Espacio(
-            nombre=space_data.nombre,
-            tipo=space_data.tipo,
-            capacidad=space_data.capacidad
-        )
+        length_str = message[:5]
+        service_code = message[5:10].strip()
+        data_str = message[10:]
         
-        db.add(new_space)
-        db.commit()
-        db.refresh(new_space)
+        try:
+            data = json.loads(data_str) if data_str else {}
+            return service_code, data
+        except json.JSONDecodeError:
+            raise ValueError("Error al decodificar JSON")
+    
+    def format_response(self, service_code: str, data: any) -> str:
+        """Formatear respuesta según protocolo SOA"""
+        json_data = json.dumps(data, ensure_ascii=False)
+        service_code = service_code.ljust(5)[:5]
+        message = service_code + json_data
+        length_str = str(len(message)).zfill(5)
         
-        # Registrar en auditoría
-        log_audit(db, "espacios", "crear", new_space.id_espacio, {}, {
-            "nombre": space_data.nombre,
-            "tipo": space_data.tipo,
-            "capacidad": space_data.capacidad
-        }, 1)  # ID del administrador que crea
-        
-        return EspacioResponse(
-            id=new_space.id_espacio,
-            nombre=new_space.nombre,
-            tipo=new_space.tipo,
-            capacidad=new_space.capacidad,
-            activo=new_space.activo,
-            fecha_creacion=new_space.fecha_creacion
-        )
-        
-    except Exception as e:
-        db.rollback()
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.get("/spaces", response_model=List[EspacioResponse])
-async def get_all_spaces(db: Session = Depends(get_db)):
-    """Obtener todos los espacios"""
-    try:
-        spaces = db.query(Espacio).all()
-        return [
-            EspacioResponse(
-                id=space.id_espacio,
-                nombre=space.nombre,
-                tipo=space.tipo,
-                capacidad=space.capacidad,
-                activo=space.activo,
-                fecha_creacion=space.fecha_creacion
-            )
-            for space in spaces
-        ]
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.get("/spaces/{space_id}", response_model=EspacioResponse)
-async def get_space(space_id: int, db: Session = Depends(get_db)):
-    """Obtener espacio por ID"""
-    try:
-        space = db.query(Espacio).filter(Espacio.id_espacio == space_id).first()
-        if not space:
-            raise HTTPException(status_code=404, detail="Espacio no encontrado")
-        
-        return EspacioResponse(
-            id=space.id_espacio,
-            nombre=space.nombre,
-            tipo=space.tipo,
-            capacidad=space.capacidad,
-            activo=space.activo,
-            fecha_creacion=space.fecha_creacion
-        )
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.get("/spaces/type/{tipo}")
-async def get_spaces_by_type(tipo: str, db: Session = Depends(get_db)):
-    """Obtener espacios por tipo (sala o cancha)"""
-    try:
-        if tipo not in ['sala', 'cancha']:
-            raise HTTPException(status_code=400, detail="Tipo debe ser 'sala' o 'cancha'")
-        
-        spaces = db.query(Espacio).filter(
-            Espacio.tipo == tipo,
-            Espacio.activo == True
-        ).all()
-        
-        return [
-            EspacioResponse(
-                id=space.id_espacio,
-                nombre=space.nombre,
-                tipo=space.tipo,
-                capacidad=space.capacidad,
-                activo=space.activo,
-                fecha_creacion=space.fecha_creacion
-            )
-            for space in spaces
-        ]
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.put("/spaces/{space_id}", response_model=EspacioResponse)
-async def update_space(space_id: int, space_data: EspacioUpdate, db: Session = Depends(get_db)):
-    """Actualizar espacio"""
-    try:
-        space = db.query(Espacio).filter(Espacio.id_espacio == space_id).first()
-        if not space:
-            raise HTTPException(status_code=404, detail="Espacio no encontrado")
-        
-        # Guardar datos anteriores para auditoría
-        datos_anteriores = {
-            "nombre": space.nombre,
-            "tipo": space.tipo,
-            "capacidad": space.capacidad,
-            "activo": space.activo
-        }
-        
-        # Actualizar campos
-        if space_data.nombre is not None:
-            space.nombre = space_data.nombre
-        if space_data.tipo is not None:
-            if space_data.tipo not in ['sala', 'cancha']:
-                raise HTTPException(status_code=400, detail="Tipo debe ser 'sala' o 'cancha'")
-            space.tipo = space_data.tipo
-        if space_data.capacidad is not None:
-            space.capacidad = space_data.capacidad
-        if space_data.activo is not None:
-            space.activo = space_data.activo
-        
-        db.commit()
-        db.refresh(space)
-        
-        # Registrar en auditoría
-        datos_nuevos = {
-            "nombre": space.nombre,
-            "tipo": space.tipo,
-            "capacidad": space.capacidad,
-            "activo": space.activo
-        }
-        log_audit(db, "espacios", "actualizar", space_id, datos_anteriores, datos_nuevos, 1)
-        
-        return EspacioResponse(
-            id=space.id_espacio,
-            nombre=space.nombre,
-            tipo=space.tipo,
-            capacidad=space.capacidad,
-            activo=space.activo,
-            fecha_creacion=space.fecha_creacion
-        )
-        
-    except Exception as e:
-        db.rollback()
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.delete("/spaces/{space_id}")
-async def deactivate_space(space_id: int, db: Session = Depends(get_db)):
-    """Desactivar espacio (soft delete)"""
-    try:
-        space = db.query(Espacio).filter(Espacio.id_espacio == space_id).first()
-        if not space:
-            raise HTTPException(status_code=404, detail="Espacio no encontrado")
-        
-        # Guardar datos anteriores para auditoría
-        datos_anteriores = {"activo": space.activo}
-        
-        # Desactivar espacio
-        space.activo = False
-        db.commit()
-        
-        # Registrar en auditoría
-        datos_nuevos = {"activo": False}
-        log_audit(db, "espacios", "desactivar", space_id, datos_anteriores, datos_nuevos, 1)
-        
-        return {"deactivated": True}
-        
-    except Exception as e:
-        db.rollback()
-        raise HTTPException(status_code=500, detail=str(e))
-
-# Endpoint para el protocolo SOA
-@app.post("/soa/message")
-async def handle_soa_message(message: str):
-    """Manejar mensajes del protocolo SOA"""
-    try:
-        protocol = SOAProtocol()
-        service_code, data = protocol.parse_message(message)
-        
-        if service_code.strip() == "space":
-            db = next(get_db())
+        return length_str + message
+    
+    def handle_create_space(self, data: dict) -> dict:
+        """Crear nuevo espacio"""
+        try:
+            nombre = data.get('nombre', '')
+            tipo = data.get('tipo', 'sala')
+            capacidad = data.get('capacidad', 10)
             
-            if "create" in data:
+            if not nombre:
+                return {"error": "Nombre del espacio es requerido"}
+            
+            valid_types = ['sala', 'cancha']
+            if tipo not in valid_types:
+                return {"error": f"Tipo inválido. Tipos válidos: {valid_types}"}
+            
+            with self.engine.connect() as conn:
+                # Verificar si el espacio ya existe
+                result = conn.execute(text(
+                    "SELECT id_espacio FROM espacios WHERE nombre = :nombre"
+                ), {"nombre": nombre})
+                
+                if result.fetchone():
+                    return {"error": "Espacio ya existe"}
+                
                 # Crear espacio
-                space_data = EspacioCreate(**data["create"])
-                result = await create_space(space_data, db)
-                response_data = {
-                    "id": result.id,
+                result = conn.execute(text("""
+                    INSERT INTO espacios (nombre, tipo, capacidad, activo)
+                    VALUES (:nombre, :tipo, :capacidad, 1)
+                """), {
+                    "nombre": nombre,
+                    "tipo": tipo,
+                    "capacidad": capacidad
+                })
+                
+                conn.commit()
+                
+                # Obtener ID del espacio creado
+                result = conn.execute(text(
+                    "SELECT id_espacio FROM espacios WHERE nombre = :nombre"
+                ), {"nombre": nombre})
+                space_id = result.fetchone()[0]
+                
+                return {
+                    "id": space_id,
                     "status": "created"
                 }
+                
+        except Exception as e:
+            return {"error": f"Error interno: {str(e)}"}
+    
+    def handle_get_all_spaces(self, data: dict) -> dict:
+        """Obtener todos los espacios"""
+        try:
+            with self.engine.connect() as conn:
+                result = conn.execute(text("""
+                    SELECT id_espacio, nombre, tipo, capacidad, activo
+                    FROM espacios ORDER BY nombre
+                """))
+                
+                spaces = []
+                for row in result:
+                    spaces.append({
+                        "id": row[0],
+                        "nombre": row[1],
+                        "tipo": row[2],
+                        "capacidad": row[3],
+                        "activo": bool(row[4])
+                    })
+                
+                return spaces
+                
+        except Exception as e:
+            return {"error": f"Error interno: {str(e)}"}
+    
+    def handle_update_space(self, data: dict) -> dict:
+        """Actualizar espacio"""
+        try:
+            space_id = data.get('id', '')
+            nombre = data.get('nombre', '')
+            tipo = data.get('tipo', '')
+            capacidad = data.get('capacidad', '')
             
-            elif "getall" in data:
-                # Obtener todos los espacios
-                spaces = await get_all_spaces(db)
-                response_data = [
-                    {
-                        "id": space.id,
-                        "nombre": space.nombre,
-                        "tipo": space.tipo
-                    }
-                    for space in spaces
-                ]
+            if not space_id:
+                return {"error": "ID del espacio es requerido"}
             
+            with self.engine.connect() as conn:
+                # Verificar que el espacio existe
+                result = conn.execute(text(
+                    "SELECT id_espacio FROM espacios WHERE id_espacio = :space_id"
+                ), {"space_id": space_id})
+                
+                if not result.fetchone():
+                    return {"error": "Espacio no encontrado"}
+                
+                # Construir query de actualización
+                updates = []
+                params = {"space_id": space_id}
+                
+                if nombre:
+                    updates.append("nombre = :nombre")
+                    params["nombre"] = nombre
+                
+                if tipo:
+                    valid_types = ['sala', 'cancha']
+                    if tipo not in valid_types:
+                        return {"error": f"Tipo inválido. Tipos válidos: {valid_types}"}
+                    updates.append("tipo = :tipo")
+                    params["tipo"] = tipo
+                
+                if capacidad:
+                    updates.append("capacidad = :capacidad")
+                    params["capacidad"] = capacidad
+                
+                if not updates:
+                    return {"error": "No hay campos para actualizar"}
+                
+                # Ejecutar actualización
+                query = f"UPDATE espacios SET {', '.join(updates)} WHERE id_espacio = :space_id"
+                conn.execute(text(query), params)
+                conn.commit()
+                
+                return {"updated": True}
+                
+        except Exception as e:
+            return {"error": f"Error interno: {str(e)}"}
+    
+    def handle_delete_space(self, data: dict) -> dict:
+        """Eliminar espacio (desactivar)"""
+        try:
+            space_id = data.get('id', '')
+            
+            if not space_id:
+                return {"error": "ID del espacio es requerido"}
+            
+            with self.engine.connect() as conn:
+                # Verificar que el espacio existe
+                result = conn.execute(text(
+                    "SELECT id_espacio FROM espacios WHERE id_espacio = :space_id"
+                ), {"space_id": space_id})
+                
+                if not result.fetchone():
+                    return {"error": "Espacio no encontrado"}
+                
+                # Desactivar espacio
+                conn.execute(text("""
+                    UPDATE espacios SET activo = 0 WHERE id_espacio = :space_id
+                """), {"space_id": space_id})
+                
+                conn.commit()
+                
+                return {"deleted": True}
+                
+        except Exception as e:
+            return {"error": f"Error interno: {str(e)}"}
+    
+    def process_message(self, message: str) -> str:
+        """Procesar mensaje recibido"""
+        try:
+            service_code, data = self.parse_message(message)
+            
+            if service_code != "space":
+                return self.format_response("space", {"error": "Servicio incorrecto"})
+            
+            # Determinar acción basada en los datos
+            if 'create' in data or ('nombre' in data and 'tipo' in data):
+                response = self.handle_create_space(data)
+            elif 'getall' in data or data == {}:
+                response = self.handle_get_all_spaces(data)
+            elif 'update' in data or ('id' in data and ('nombre' in data or 'tipo' in data or 'capacidad' in data)):
+                response = self.handle_update_space(data)
+            elif 'delete' in data or ('id' in data and 'action' in data and data['action'] == 'delete'):
+                response = self.handle_delete_space(data)
             else:
-                response_data = {"error": "Comando no reconocido"}
-        
-        else:
-            response_data = {"error": "Servicio no reconocido"}
-        
-        # Formatear respuesta según protocolo SOA
-        return protocol.format_message("space", response_data)
-        
-    except Exception as e:
-        return SOAProtocol().format_message("space", {"error": str(e)})
+                response = {"error": "Acción no reconocida"}
+            
+            return self.format_response("space", response)
+            
+        except Exception as e:
+            return self.format_response("space", {"error": str(e)})
+    
+    def handle_client(self, client_socket: socket.socket, address: tuple):
+        """Manejar cliente conectado"""
+        try:
+            print(f"[SPACE] Conexión establecida desde {address}")
+            
+            while True:
+                # Recibir mensaje
+                message = client_socket.recv(4096).decode('utf-8')
+                if not message:
+                    break
+                
+                print(f"[SPACE] Mensaje recibido: {message[:50]}...")
+                
+                # Procesar mensaje
+                response = self.process_message(message)
+                
+                # Enviar respuesta
+                client_socket.sendall(response.encode('utf-8'))
+                print(f"[SPACE] Respuesta enviada: {response[:50]}...")
+                
+        except Exception as e:
+            print(f"[SPACE] Error manejando cliente {address}: {e}")
+        finally:
+            client_socket.close()
+            print(f"[SPACE] Conexión cerrada con {address}")
+    
+    def start(self):
+        """Iniciar servicio de espacios"""
+        try:
+            self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            self.server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            self.server_socket.bind((self.host, self.port))
+            self.server_socket.listen(5)
+            
+            self.running = True
+            print(f"[SPACE] Servicio de Espacios iniciado en {self.host}:{self.port}")
+            
+            while self.running:
+                try:
+                    client_socket, address = self.server_socket.accept()
+                    client_thread = threading.Thread(
+                        target=self.handle_client,
+                        args=(client_socket, address)
+                    )
+                    client_thread.daemon = True
+                    client_thread.start()
+                    
+                except socket.error as e:
+                    if self.running:
+                        print(f"[SPACE] Error aceptando conexión: {e}")
+                    
+        except Exception as e:
+            print(f"[SPACE] Error iniciando servicio: {e}")
+        finally:
+            self.stop()
+    
+    def stop(self):
+        """Detener servicio de espacios"""
+        self.running = False
+        if self.server_socket:
+            self.server_socket.close()
+        print("[SPACE] Servicio de Espacios detenido")
+
+def main():
+    """Función principal"""
+    service = SpaceService()
+    try:
+        service.start()
+    except KeyboardInterrupt:
+        print("\n[SPACE] Deteniendo servicio...")
+        service.stop()
 
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=5003)
-
+    main()

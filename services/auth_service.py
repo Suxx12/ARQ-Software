@@ -1,199 +1,263 @@
+#!/usr/bin/env python3
 """
 Servicio de Autenticación (AUTH) - Sistema de Reservación UDP
 Puerto: 5001
+Protocolo SOA: NNNNNSSSSSDATOS
 """
+import socket
+import threading
+import json
+import hashlib
+import jwt
+from datetime import datetime, timedelta
 import os
-import sys
-sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from dotenv import load_dotenv
+from sqlalchemy import create_engine, text
 
-from fastapi import FastAPI, HTTPException, Depends
-from sqlalchemy.orm import Session
-from pydantic import BaseModel
-from typing import Optional
-import uvicorn
+# Cargar variables de entorno
+load_dotenv('config.env')
 
-from database.db_config import get_db, init_db
-from database.models import Usuario
-from services.common.auth_utils import verify_password, get_password_hash, create_access_token, verify_token
-from services.common.soa_protocol import SOAProtocol
-from datetime import timedelta
-
-app = FastAPI(title="Servicio de Autenticación - AUTH")
-
-# Inicializar base de datos
-init_db()
-
-# Modelos Pydantic
-class LoginRequest(BaseModel):
-    rut: str
-    password: str
-
-class TokenResponse(BaseModel):
-    token: str
-    ok: bool
-    user_info: Optional[dict] = None
-
-class RefreshRequest(BaseModel):
-    refresh_token: str
-
-class LogoutRequest(BaseModel):
-    token: str
-
-@app.post("/auth/login")
-async def login(request: LoginRequest, db: Session = Depends(get_db)):
-    """Iniciar sesión de usuario"""
-    try:
-        # Buscar usuario por RUT
-        user = db.query(Usuario).filter(
-            Usuario.rut == request.rut,
-            Usuario.activo == True
-        ).first()
+class AuthService:
+    """Servicio de Autenticación según especificación SOA"""
+    
+    def __init__(self, host: str = "localhost", port: int = 5001):
+        self.host = host
+        self.port = port
+        self.running = False
+        self.server_socket = None
         
-        if not user:
-            raise HTTPException(status_code=401, detail="Credenciales inválidas")
+        # Configuración de base de datos
+        DATABASE_URL = os.getenv('DATABASE_URL', 'sqlite:///./reservas_udp.db')
+        self.engine = create_engine(DATABASE_URL)
         
-        # En un sistema real, aquí verificarías la contraseña
-        # Para este ejemplo, asumimos que la contraseña es válida si el usuario existe
-        # En producción deberías tener un campo password_hash en la tabla usuarios
+        # Configuración JWT
+        self.SECRET_KEY = os.getenv('SECRET_KEY', 'tu_clave_secreta_muy_segura_aqui')
+        self.ALGORITHM = "HS256"
+        self.ACCESS_TOKEN_EXPIRE_MINUTES = 30
+    
+    def create_access_token(self, data: dict):
+        """Crear token JWT"""
+        to_encode = data.copy()
+        expire = datetime.utcnow() + timedelta(minutes=self.ACCESS_TOKEN_EXPIRE_MINUTES)
+        to_encode.update({"exp": expire})
+        encoded_jwt = jwt.encode(to_encode, self.SECRET_KEY, algorithm=self.ALGORITHM)
+        return encoded_jwt
+    
+    def verify_token(self, token: str):
+        """Verificar token JWT"""
+        try:
+            payload = jwt.decode(token, self.SECRET_KEY, algorithms=[self.ALGORITHM])
+            return payload
+        except jwt.ExpiredSignatureError:
+            return None
+        except jwt.JWTError:
+            return None
+    
+    def parse_message(self, message: str) -> tuple:
+        """Parsear mensaje según protocolo SOA"""
+        if len(message) < 10:
+            raise ValueError("Mensaje muy corto")
         
-        # Crear token de acceso
-        token_data = {
-            "sub": str(user.id_usuario),
-            "rut": user.rut,
-            "tipo_usuario": user.tipo_usuario,
-            "nombre": user.nombre
-        }
+        length_str = message[:5]
+        service_code = message[5:10].strip()
+        data_str = message[10:]
         
-        access_token = create_access_token(token_data)
+        try:
+            data = json.loads(data_str) if data_str else {}
+            return service_code, data
+        except json.JSONDecodeError:
+            raise ValueError("Error al decodificar JSON")
+    
+    def format_response(self, service_code: str, data: any) -> str:
+        """Formatear respuesta según protocolo SOA"""
+        json_data = json.dumps(data, ensure_ascii=False)
+        service_code = service_code.ljust(5)[:5]
+        message = service_code + json_data
+        length_str = str(len(message)).zfill(5)
         
-        user_info = {
-            "id": user.id_usuario,
-            "rut": user.rut,
-            "nombre": user.nombre,
-            "tipo_usuario": user.tipo_usuario,
-            "correo": user.correo_institucional
-        }
-        
-        return TokenResponse(
-            token=access_token,
-            ok=True,
-            user_info=user_info
-        )
-        
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.post("/auth/refresh")
-async def refresh_token(request: RefreshRequest):
-    """Renovar token de acceso"""
-    try:
-        # Verificar token actual
-        payload = verify_token(request.refresh_token)
-        if not payload:
-            raise HTTPException(status_code=401, detail="Token inválido")
-        
-        # Crear nuevo token
-        new_token_data = {
-            "sub": payload.get("sub"),
-            "rut": payload.get("rut"),
-            "tipo_usuario": payload.get("tipo_usuario"),
-            "nombre": payload.get("nombre")
-        }
-        
-        new_token = create_access_token(new_token_data)
-        
-        return TokenResponse(
-            token=new_token,
-            ok=True
-        )
-        
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.post("/auth/logout")
-async def logout(request: LogoutRequest):
-    """Cerrar sesión"""
-    try:
-        # En un sistema real, aquí invalidarías el token en una lista negra
-        # Para este ejemplo, simplemente confirmamos el logout
-        
-        return {"logout": True}
-        
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.get("/auth/verify/{token}")
-async def verify_user_token(token: str):
-    """Verificar token de usuario"""
-    try:
-        payload = verify_token(token)
-        if not payload:
-            raise HTTPException(status_code=401, detail="Token inválido o expirado")
-        
-        return {
-            "valid": True,
-            "user_info": {
-                "id": payload.get("sub"),
-                "rut": payload.get("rut"),
-                "tipo_usuario": payload.get("tipo_usuario"),
-                "nombre": payload.get("nombre")
-            }
-        }
-        
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-# Endpoint para el protocolo SOA
-@app.post("/soa/message")
-async def handle_soa_message(message: str):
-    """Manejar mensajes del protocolo SOA"""
-    try:
-        protocol = SOAProtocol()
-        service_code, data = protocol.parse_message(message)
-        
-        if service_code.strip() == "auth":
-            # Procesar comando de autenticación
-            if "rut" in data and "pass" in data:
-                # Login
-                login_req = LoginRequest(rut=data["rut"], password=data["pass"])
-                db = next(get_db())
-                result = await login(login_req, db)
+        return length_str + message
+    
+    def handle_login(self, data: dict) -> dict:
+        """Manejar inicio de sesión"""
+        try:
+            # Parsear parámetros del mensaje
+            rut = data.get('rut', '')
+            password = data.get('pass', '')
+            
+            if not rut:
+                return {"error": "RUT requerido"}
+            
+            with self.engine.connect() as conn:
+                # Buscar usuario por RUT
+                result = conn.execute(text(
+                    "SELECT id_usuario, rut, correo_institucional, nombre, tipo_usuario FROM usuarios WHERE rut = :rut AND activo = 1"
+                ), {"rut": rut})
+                user = result.fetchone()
                 
-                if result.ok:
-                    response_data = {
-                        "token": result.token,
-                        "ok": True
-                    }
-                else:
-                    response_data = {"error": "Credenciales inválidas"}
-            
-            elif "refresh" in data:
-                # Refresh token
-                refresh_req = RefreshRequest(refresh_token=data["refresh"])
-                result = await refresh_token(refresh_req)
-                response_data = {
-                    "token": result.token,
-                    "ok": result.ok
+                if not user:
+                    return {"error": "Credenciales inválidas"}
+                
+                # Crear token de acceso
+                token_data = {
+                    "sub": str(user[0]),
+                    "rut": user[1],
+                    "email": user[2],
+                    "nombre": user[3],
+                    "tipo_usuario": user[4]
                 }
+                
+                access_token = self.create_access_token(token_data)
+                
+                return {
+                    "token": access_token,
+                    "ok": True,
+                    "usuario": {
+                        "id": user[0],
+                        "rut": user[1],
+                        "email": user[2],
+                        "nombre": user[3],
+                        "tipo_usuario": user[4]
+                    }
+                }
+                
+        except Exception as e:
+            return {"error": f"Error interno: {str(e)}"}
+    
+    def handle_refresh(self, data: dict) -> dict:
+        """Manejar renovación de token"""
+        try:
+            token = data.get('refresh', '')
             
-            elif "logout" in data:
-                # Logout
-                logout_req = LogoutRequest(token=data["logout"])
-                result = await logout(logout_req)
-                response_data = result
+            if not token:
+                return {"error": "Token requerido"}
             
+            payload = self.verify_token(token)
+            if payload is None:
+                return {"error": "Token inválido"}
+            
+            # Crear nuevo token
+            new_token = self.create_access_token(payload)
+            
+            return {
+                "token": new_token,
+                "ok": True
+            }
+            
+        except Exception as e:
+            return {"error": f"Error interno: {str(e)}"}
+    
+    def handle_logout(self, data: dict) -> dict:
+        """Manejar cierre de sesión"""
+        try:
+            token = data.get('logout', '')
+            
+            if not token:
+                return {"error": "Token requerido"}
+            
+            # Verificar token
+            payload = self.verify_token(token)
+            if payload is None:
+                return {"error": "Token inválido"}
+            
+            return {"logout": True}
+            
+        except Exception as e:
+            return {"error": f"Error interno: {str(e)}"}
+    
+    def process_message(self, message: str) -> str:
+        """Procesar mensaje recibido"""
+        try:
+            service_code, data = self.parse_message(message)
+            
+            if service_code != "auth":
+                return self.format_response("auth", {"error": "Servicio incorrecto"})
+            
+            # Determinar acción basada en los datos
+            if 'rut' in data and 'pass' in data:
+                response = self.handle_login(data)
+            elif 'refresh' in data:
+                response = self.handle_refresh(data)
+            elif 'logout' in data:
+                response = self.handle_logout(data)
             else:
-                response_data = {"error": "Comando no reconocido"}
-        
-        else:
-            response_data = {"error": "Servicio no reconocido"}
-        
-        # Formatear respuesta según protocolo SOA
-        return protocol.format_message("auth", response_data)
-        
-    except Exception as e:
-        return SOAProtocol().format_message("auth", {"error": str(e)})
+                response = {"error": "Acción no reconocida"}
+            
+            return self.format_response("auth", response)
+            
+        except Exception as e:
+            return self.format_response("auth", {"error": str(e)})
+    
+    def handle_client(self, client_socket: socket.socket, address: tuple):
+        """Manejar cliente conectado"""
+        try:
+            print(f"[AUTH] Conexión establecida desde {address}")
+            
+            while True:
+                # Recibir mensaje
+                message = client_socket.recv(4096).decode('utf-8')
+                if not message:
+                    break
+                
+                print(f"[AUTH] Mensaje recibido: {message[:50]}...")
+                
+                # Procesar mensaje
+                response = self.process_message(message)
+                
+                # Enviar respuesta
+                client_socket.sendall(response.encode('utf-8'))
+                print(f"[AUTH] Respuesta enviada: {response[:50]}...")
+                
+        except Exception as e:
+            print(f"[AUTH] Error manejando cliente {address}: {e}")
+        finally:
+            client_socket.close()
+            print(f"[AUTH] Conexión cerrada con {address}")
+    
+    def start(self):
+        """Iniciar servicio de autenticación"""
+        try:
+            self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            self.server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            self.server_socket.bind((self.host, self.port))
+            self.server_socket.listen(5)
+            
+            self.running = True
+            print(f"[AUTH] Servicio de Autenticación iniciado en {self.host}:{self.port}")
+            
+            while self.running:
+                try:
+                    client_socket, address = self.server_socket.accept()
+                    client_thread = threading.Thread(
+                        target=self.handle_client,
+                        args=(client_socket, address)
+                    )
+                    client_thread.daemon = True
+                    client_thread.start()
+                    
+                except socket.error as e:
+                    if self.running:
+                        print(f"[AUTH] Error aceptando conexión: {e}")
+                    
+        except Exception as e:
+            print(f"[AUTH] Error iniciando servicio: {e}")
+        finally:
+            self.stop()
+    
+    def stop(self):
+        """Detener servicio de autenticación"""
+        self.running = False
+        if self.server_socket:
+            self.server_socket.close()
+        print("[AUTH] Servicio de Autenticación detenido")
+
+def main():
+    """Función principal"""
+    service = AuthService()
+    try:
+        service.start()
+    except KeyboardInterrupt:
+        print("\n[AUTH] Deteniendo servicio...")
+        service.stop()
 
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=5001)
-
+    main()

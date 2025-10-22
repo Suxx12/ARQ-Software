@@ -1,327 +1,377 @@
+#!/usr/bin/env python3
 """
 Servicio de Incidencias (INCID) - Sistema de Reservación UDP
 Puerto: 5006
+Protocolo SOA: NNNNNSSSSSDATOS
 """
+import socket
+import threading
+import json
 import os
-import sys
-sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from dotenv import load_dotenv
+from sqlalchemy import create_engine, text
+from datetime import datetime, timedelta
 
-from fastapi import FastAPI, HTTPException, Depends
-from sqlalchemy.orm import Session
-from sqlalchemy import and_
-from pydantic import BaseModel
-from typing import List, Optional
-from datetime import datetime
-import uvicorn
+# Cargar variables de entorno
+load_dotenv('config.env')
 
-from database.db_config import get_db, init_db
-from database.models import Incidencia, Espacio, Usuario, Reserva, Notificacion, Auditoria
-from services.common.soa_protocol import SOAProtocol
-
-app = FastAPI(title="Servicio de Incidencias - INCID")
-
-# Inicializar base de datos
-init_db()
-
-# Modelos Pydantic
-class IncidenciaCreate(BaseModel):
-    id_espacio: int
-    tipo_incidencia: str
-    descripcion: str
-    id_usuario_reporta: int
-
-class IncidenciaResponse(BaseModel):
-    id: int
-    id_espacio: int
-    tipo_incidencia: str
-    descripcion: str
-    estado: str
-    fecha_reporte: datetime
-    espacio_nombre: str
-    usuario_reporta_nombre: str
-
-class BloqueoRequest(BaseModel):
-    id_incidencia: int
-    fecha_inicio: str
-    fecha_fin: str
-    id_administrador: int
-
-class ResolverIncidenciaRequest(BaseModel):
-    id_incidencia: int
-    solucion: str
-    id_usuario_resuelve: int
-
-def log_audit(db: Session, tabla: str, accion: str, id_registro: int, datos_anteriores: dict, datos_nuevos: dict, id_usuario: int):
-    """Registrar acción en auditoría"""
-    audit = Auditoria(
-        tabla_afectada=tabla,
-        accion=accion,
-        id_registro=id_registro,
-        datos_anteriores=datos_anteriores,
-        datos_nuevos=datos_nuevos,
-        id_usuario=id_usuario
-    )
-    db.add(audit)
-    db.commit()
-
-def create_notification(db: Session, tipo: str, email_destinatario: str, asunto: str, contenido: str, id_reserva: int = None):
-    """Crear notificación"""
-    notif = Notificacion(
-        tipo_notificacion=tipo,
-        destinatario_email=email_destinatario,
-        asunto=asunto,
-        contenido=contenido,
-        id_reserva=id_reserva
-    )
-    db.add(notif)
-    db.commit()
-
-@app.post("/incidents/report", response_model=IncidenciaResponse)
-async def report_incident(incident_data: IncidenciaCreate, db: Session = Depends(get_db)):
-    """Reportar incidencia"""
-    try:
-        # Verificar que el espacio y usuario existen
-        espacio = db.query(Espacio).filter(Espacio.id_espacio == incident_data.id_espacio).first()
-        if not espacio:
-            raise HTTPException(status_code=404, detail="Espacio no encontrado")
+class IncidentService:
+    """Servicio de Incidencias según especificación SOA"""
+    
+    def __init__(self, host: str = "localhost", port: int = 5006):
+        self.host = host
+        self.port = port
+        self.running = False
+        self.server_socket = None
         
-        usuario = db.query(Usuario).filter(Usuario.id_usuario == incident_data.id_usuario_reporta).first()
-        if not usuario:
-            raise HTTPException(status_code=404, detail="Usuario no encontrado")
+        # Configuración de base de datos
+        DATABASE_URL = os.getenv('DATABASE_URL', 'sqlite:///./reservas_udp.db')
+        self.engine = create_engine(DATABASE_URL)
+    
+    def parse_message(self, message: str) -> tuple:
+        """Parsear mensaje según protocolo SOA"""
+        if len(message) < 10:
+            raise ValueError("Mensaje muy corto")
         
-        # Crear incidencia
-        new_incident = Incidencia(
-            id_espacio=incident_data.id_espacio,
-            tipo_incidencia=incident_data.tipo_incidencia,
-            descripcion=incident_data.descripcion,
-            id_usuario_reporta=incident_data.id_usuario_reporta,
-            estado='abierta'
-        )
+        length_str = message[:5]
+        service_code = message[5:10].strip()
+        data_str = message[10:]
         
-        db.add(new_incident)
-        db.commit()
-        db.refresh(new_incident)
+        try:
+            data = json.loads(data_str) if data_str else {}
+            return service_code, data
+        except json.JSONDecodeError:
+            raise ValueError("Error al decodificar JSON")
+    
+    def format_response(self, service_code: str, data: any) -> str:
+        """Formatear respuesta según protocolo SOA"""
+        json_data = json.dumps(data, ensure_ascii=False)
+        service_code = service_code.ljust(5)[:5]
+        message = service_code + json_data
+        length_str = str(len(message)).zfill(5)
         
-        # Registrar en auditoría
-        log_audit(db, "incidencias", "crear", new_incident.id_incidencia, {}, {
-            "id_espacio": incident_data.id_espacio,
-            "tipo_incidencia": incident_data.tipo_incidencia,
-            "descripcion": incident_data.descripcion,
-            "estado": "abierta"
-        }, incident_data.id_usuario_reporta)
-        
-        return IncidenciaResponse(
-            id=new_incident.id_incidencia,
-            id_espacio=new_incident.id_espacio,
-            tipo_incidencia=new_incident.tipo_incidencia,
-            descripcion=new_incident.descripcion,
-            estado=new_incident.estado,
-            fecha_reporte=new_incident.fecha_reporte,
-            espacio_nombre=espacio.nombre,
-            usuario_reporta_nombre=usuario.nombre
-        )
-        
-    except Exception as e:
-        db.rollback()
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.get("/incidents", response_model=List[IncidenciaResponse])
-async def get_incidents(db: Session = Depends(get_db)):
-    """Obtener todas las incidencias"""
-    try:
-        incidents = db.query(Incidencia).join(Espacio).join(Usuario).all()
-        
-        return [
-            IncidenciaResponse(
-                id=incident.id_incidencia,
-                id_espacio=incident.id_espacio,
-                tipo_incidencia=incident.tipo_incidencia,
-                descripcion=incident.descripcion,
-                estado=incident.estado,
-                fecha_reporte=incident.fecha_reporte,
-                espacio_nombre=incident.espacio.nombre,
-                usuario_reporta_nombre=incident.usuario_reporta.nombre
-            )
-            for incident in incidents
-        ]
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.post("/incidents/block")
-async def apply_block(request: BloqueoRequest, db: Session = Depends(get_db)):
-    """Aplicar bloqueo por incidencia"""
-    try:
-        # Verificar que la incidencia existe
-        incident = db.query(Incidencia).filter(Incidencia.id_incidencia == request.id_incidencia).first()
-        if not incident:
-            raise HTTPException(status_code=404, detail="Incidencia no encontrada")
-        
-        # Parsear fechas
-        fecha_inicio = datetime.fromisoformat(request.fecha_inicio.replace('Z', '+00:00'))
-        fecha_fin = datetime.fromisoformat(request.fecha_fin.replace('Z', '+00:00'))
-        
-        # Crear bloqueo como reserva especial
-        bloqueo = Reserva(
-            id_usuario=1,  # Usuario sistema
-            id_espacio=incident.id_espacio,
-            fecha_inicio=fecha_inicio,
-            fecha_fin=fecha_fin,
-            estado='bloqueo',
-            tipo_reserva='bloqueo',
-            motivo=f"Bloqueo por incidencia: {incident.descripcion}",
-            descripcion_incidencia=incident.descripcion
-        )
-        
-        db.add(bloqueo)
-        db.commit()
-        db.refresh(bloqueo)
-        
-        # Cancelar reservas afectadas
-        reservas_afectadas = db.query(Reserva).filter(
-            and_(
-                Reserva.id_espacio == incident.id_espacio,
-                Reserva.estado.in_(['pendiente', 'aprobada']),
-                Reserva.tipo_reserva == 'normal',
-                Reserva.fecha_inicio >= fecha_inicio,
-                Reserva.fecha_fin <= fecha_fin
-            )
-        ).all()
-        
-        reservas_canceladas = 0
-        for reserva in reservas_afectadas:
-            reserva.estado = 'cancelada'
-            reserva.motivo = f"Cancelada por bloqueo por incidencia ID: {request.id_incidencia}"
+        return length_str + message
+    
+    def handle_report_incident(self, data: dict) -> dict:
+        """Reportar nueva incidencia"""
+        try:
+            space_id = data.get('space', '')
+            tipo = data.get('tipo', '')
+            descripcion = data.get('descripcion', '')
+            user_id = data.get('user', '')
             
-            # Notificar cancelación
-            create_notification(
-                db, "reserva_cancelada", 
-                reserva.usuario.correo_institucional,
-                "Reserva Cancelada por Incidencia",
-                f"Su reserva para {reserva.espacio.nombre} ha sido cancelada debido a una incidencia reportada.",
-                reserva.id_reserva
-            )
-            reservas_canceladas += 1
-        
-        db.commit()
-        
-        # Actualizar estado de la incidencia
-        incident.estado = 'en_progreso'
-        db.commit()
-        
-        return {"bloqueado": True, "reservas_canceladas": reservas_canceladas}
-        
-    except Exception as e:
-        db.rollback()
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.post("/incidents/resolve")
-async def resolve_incident(request: ResolverIncidenciaRequest, db: Session = Depends(get_db)):
-    """Resolver incidencia"""
-    try:
-        incident = db.query(Incidencia).filter(Incidencia.id_incidencia == request.id_incidencia).first()
-        if not incident:
-            raise HTTPException(status_code=404, detail="Incidencia no encontrada")
-        
-        # Guardar datos anteriores para auditoría
-        datos_anteriores = {"estado": incident.estado}
-        
-        # Resolver incidencia
-        incident.estado = 'resuelta'
-        incident.solucion = request.solucion
-        incident.id_usuario_resuelve = request.id_usuario_resuelve
-        incident.fecha_resolucion = datetime.now()
-        
-        db.commit()
-        
-        # Registrar en auditoría
-        datos_nuevos = {"estado": "resuelta", "solucion": request.solucion}
-        log_audit(db, "incidencias", "resolver", request.id_incidencia, datos_anteriores, datos_nuevos, request.id_usuario_resuelve)
-        
-        # Verificar si hay bloqueos activos para este espacio
-        bloqueos_activos = db.query(Reserva).filter(
-            and_(
-                Reserva.id_espacio == incident.id_espacio,
-                Reserva.tipo_reserva == 'bloqueo',
-                Reserva.estado == 'bloqueo',
-                Reserva.fecha_fin > datetime.now()
-            )
-        ).all()
-        
-        espacio_liberado = len(bloqueos_activos) > 0
-        
-        # Remover bloqueos activos
-        for bloqueo in bloqueos_activos:
-            bloqueo.estado = 'cancelada'
-        
-        db.commit()
-        
-        return {"resuelta": True, "espacio_liberado": espacio_liberado}
-        
-    except Exception as e:
-        db.rollback()
-        raise HTTPException(status_code=500, detail=str(e))
-
-# Endpoint para el protocolo SOA
-@app.post("/soa/message")
-async def handle_soa_message(message: str):
-    """Manejar mensajes del protocolo SOA"""
-    try:
-        protocol = SOAProtocol()
-        service_code, data = protocol.parse_message(message)
-        
-        if service_code.strip() == "incid":
-            db = next(get_db())
+            if not all([space_id, tipo, descripcion]):
+                return {"error": "Espacio, tipo y descripción son requeridos"}
             
-            if "report" in data and "space" in data["report"]:
-                # Reportar incidencia
-                incident_data = IncidenciaCreate(
-                    id_espacio=int(data["report"]["space"]),
-                    tipo_incidencia=data["report"]["tipo"],
-                    descripcion=data["report"]["descripcion"],
-                    id_usuario_reporta=1  # Usuario por defecto
-                )
-                result = await report_incident(incident_data, db)
-                response_data = {
-                    "id_incidencia": result.id,
-                    "estado": result.estado
+            valid_types = ['mantencion', 'averia', 'limpieza', 'otro']
+            if tipo not in valid_types:
+                return {"error": f"Tipo inválido. Tipos válidos: {valid_types}"}
+            
+            with self.engine.connect() as conn:
+                # Verificar que el espacio existe
+                space_result = conn.execute(text(
+                    "SELECT id_espacio FROM espacios WHERE id_espacio = :space_id AND activo = 1"
+                ), {"space_id": space_id})
+                
+                if not space_result.fetchone():
+                    return {"error": "Espacio no encontrado"}
+                
+                # Crear incidencia
+                result = conn.execute(text("""
+                    INSERT INTO incidencias (id_espacio, tipo, descripcion, estado, 
+                                           fecha_reporte, id_usuario_reporte)
+                    VALUES (:space_id, :tipo, :descripcion, 'abierta', 
+                            :fecha_reporte, :user_id)
+                """), {
+                    "space_id": space_id,
+                    "tipo": tipo,
+                    "descripcion": descripcion,
+                    "fecha_reporte": datetime.now(),
+                    "user_id": user_id
+                })
+                
+                conn.commit()
+                
+                # Obtener ID de la incidencia creada
+                incident_result = conn.execute(text("""
+                    SELECT id_incidencia FROM incidencias 
+                    WHERE id_espacio = :space_id AND descripcion = :descripcion
+                    ORDER BY fecha_reporte DESC LIMIT 1
+                """), {"space_id": space_id, "descripcion": descripcion})
+                
+                incident_id = incident_result.fetchone()[0]
+                
+                return {
+                    "id_incidencia": incident_id,
+                    "estado": "abierta"
                 }
+                
+        except Exception as e:
+            return {"error": f"Error interno: {str(e)}"}
+    
+    def handle_apply_block(self, data: dict) -> dict:
+        """Aplicar bloqueo por incidencia"""
+        try:
+            incidencia_id = data.get('incidencia', '')
+            inicio = data.get('inicio', '')
+            fin = data.get('fin', '')
             
-            elif "block" in data and "incidencia" in data["block"]:
-                # Aplicar bloqueo
-                request = BloqueoRequest(
-                    id_incidencia=int(data["block"]["incidencia"]),
-                    fecha_inicio=data["block"]["inicio"],
-                    fecha_fin=data["block"]["fin"],
-                    id_administrador=1
-                )
-                result = await apply_block(request, db)
-                response_data = {"bloqueado": result["bloqueado"], "reservas_canceladas": result["reservas_canceladas"]}
+            if not all([incidencia_id, inicio, fin]):
+                return {"error": "ID de incidencia, inicio y fin son requeridos"}
             
-            elif "resolve" in data and "incidencia" in data["resolve"]:
-                # Resolver incidencia
-                request = ResolverIncidenciaRequest(
-                    id_incidencia=int(data["resolve"]["incidencia"]),
-                    solucion=data["resolve"]["solucion"],
-                    id_usuario_resuelve=1
-                )
-                result = await resolve_incident(request, db)
-                response_data = {"resuelta": result["resuelta"], "espacio_liberado": result["espacio_liberado"]}
+            # Parsear fechas
+            try:
+                fecha_inicio = datetime.fromisoformat(inicio.replace('T', ' '))
+                fecha_fin = datetime.fromisoformat(fin.replace('T', ' '))
+                
+                if fecha_fin <= fecha_inicio:
+                    return {"error": "La fecha de fin debe ser posterior a la de inicio"}
+                
+            except ValueError as e:
+                return {"error": f"Formato de fecha inválido: {str(e)}"}
             
+            with self.engine.connect() as conn:
+                # Verificar que la incidencia existe
+                incident_result = conn.execute(text("""
+                    SELECT id_espacio FROM incidencias WHERE id_incidencia = :incidencia_id
+                """), {"incidencia_id": incidencia_id})
+                
+                incident_row = incident_result.fetchone()
+                if not incident_row:
+                    return {"error": "Incidencia no encontrada"}
+                
+                space_id = incident_row[0]
+                
+                # Cancelar reservas afectadas
+                cancel_result = conn.execute(text("""
+                    UPDATE reservas SET estado = 'cancelada' 
+                    WHERE id_espacio = :space_id 
+                    AND estado IN ('pendiente', 'aprobada')
+                    AND (
+                        (fecha_inicio < :fecha_fin AND fecha_fin > :fecha_inicio)
+                    )
+                """), {
+                    "space_id": space_id,
+                    "fecha_inicio": fecha_inicio,
+                    "fecha_fin": fecha_fin
+                })
+                
+                reservas_canceladas = cancel_result.rowcount
+                
+                # Crear bloqueo
+                conn.execute(text("""
+                    INSERT INTO reservas (id_espacio, fecha_inicio, fecha_fin, estado, 
+                                        motivo, fecha_solicitud, tipo_reserva, descripcion_incidencia)
+                    VALUES (:space_id, :fecha_inicio, :fecha_fin, 'bloqueo', 
+                            'Bloqueo por incidencia', :fecha_solicitud, 'bloqueo', :descripcion)
+                """), {
+                    "space_id": space_id,
+                    "fecha_inicio": fecha_inicio,
+                    "fecha_fin": fecha_fin,
+                    "fecha_solicitud": datetime.now(),
+                    "descripcion": f"Incidencia #{incidencia_id}"
+                })
+                
+                conn.commit()
+                
+                return {
+                    "bloqueado": True,
+                    "reservas_canceladas": reservas_canceladas
+                }
+                
+        except Exception as e:
+            return {"error": f"Error interno: {str(e)}"}
+    
+    def handle_resolve_incident(self, data: dict) -> dict:
+        """Resolver incidencia"""
+        try:
+            incidencia_id = data.get('incidencia', '')
+            solucion = data.get('solucion', '')
+            
+            if not incidencia_id:
+                return {"error": "ID de incidencia es requerido"}
+            
+            with self.engine.connect() as conn:
+                # Verificar que la incidencia existe
+                incident_result = conn.execute(text("""
+                    SELECT id_espacio FROM incidencias WHERE id_incidencia = :incidencia_id
+                """), {"incidencia_id": incidencia_id})
+                
+                incident_row = incident_result.fetchone()
+                if not incident_row:
+                    return {"error": "Incidencia no encontrada"}
+                
+                space_id = incident_row[0]
+                
+                # Marcar incidencia como resuelta
+                conn.execute(text("""
+                    UPDATE incidencias SET estado = 'resuelta', solucion = :solucion, 
+                                         fecha_resolucion = :fecha_resolucion
+                    WHERE id_incidencia = :incidencia_id
+                """), {
+                    "solucion": solucion,
+                    "fecha_resolucion": datetime.now(),
+                    "incidencia_id": incidencia_id
+                })
+                
+                # Eliminar bloqueos activos del espacio
+                block_result = conn.execute(text("""
+                    DELETE FROM reservas 
+                    WHERE id_espacio = :space_id AND tipo_reserva = 'bloqueo' AND estado = 'bloqueo'
+                """), {"space_id": space_id})
+                
+                conn.commit()
+                
+                return {
+                    "resuelta": True,
+                    "espacio_liberado": True
+                }
+                
+        except Exception as e:
+            return {"error": f"Error interno: {str(e)}"}
+    
+    def handle_get_incidents(self, data: dict) -> dict:
+        """Obtener incidencias"""
+        try:
+            estado = data.get('estado', '')
+            space_id = data.get('space', '')
+            
+            with self.engine.connect() as conn:
+                query = """
+                    SELECT i.id_incidencia, e.nombre, i.tipo, i.descripcion, 
+                           i.estado, i.fecha_reporte, i.solucion, i.fecha_resolucion
+                    FROM incidencias i
+                    JOIN espacios e ON i.id_espacio = e.id_espacio
+                    WHERE 1=1
+                """
+                params = {}
+                
+                if estado:
+                    query += " AND i.estado = :estado"
+                    params["estado"] = estado
+                
+                if space_id:
+                    query += " AND i.id_espacio = :space_id"
+                    params["space_id"] = space_id
+                
+                query += " ORDER BY i.fecha_reporte DESC"
+                
+                result = conn.execute(text(query), params)
+                
+                incidents = []
+                for row in result:
+                    incidents.append({
+                        "id": row[0],
+                        "espacio": row[1],
+                        "tipo": row[2],
+                        "descripcion": row[3],
+                        "estado": row[4],
+                        "fecha_reporte": row[5].isoformat(),
+                        "solucion": row[6],
+                        "fecha_resolucion": row[7].isoformat() if row[7] else None
+                    })
+                
+                return incidents
+                
+        except Exception as e:
+            return {"error": f"Error interno: {str(e)}"}
+    
+    def process_message(self, message: str) -> str:
+        """Procesar mensaje recibido"""
+        try:
+            service_code, data = self.parse_message(message)
+            
+            if service_code != "incid":
+                return self.format_response("incid", {"error": "Servicio incorrecto"})
+            
+            # Determinar acción basada en los datos
+            if 'report' in data or ('space' in data and 'tipo' in data and 'descripcion' in data):
+                response = self.handle_report_incident(data)
+            elif 'block' in data or ('incidencia' in data and 'inicio' in data and 'fin' in data):
+                response = self.handle_apply_block(data)
+            elif 'resolve' in data or ('incidencia' in data and 'solucion' in data):
+                response = self.handle_resolve_incident(data)
+            elif 'getall' in data or data == {}:
+                response = self.handle_get_incidents(data)
             else:
-                response_data = {"error": "Comando no reconocido"}
-        
-        else:
-            response_data = {"error": "Servicio no reconocido"}
-        
-        # Formatear respuesta según protocolo SOA
-        return protocol.format_message("incid", response_data)
-        
-    except Exception as e:
-        return SOAProtocol().format_message("incid", {"error": str(e)})
+                response = {"error": "Acción no reconocida"}
+            
+            return self.format_response("incid", response)
+            
+        except Exception as e:
+            return self.format_response("incid", {"error": str(e)})
+    
+    def handle_client(self, client_socket: socket.socket, address: tuple):
+        """Manejar cliente conectado"""
+        try:
+            print(f"[INCID] Conexión establecida desde {address}")
+            
+            while True:
+                # Recibir mensaje
+                message = client_socket.recv(4096).decode('utf-8')
+                if not message:
+                    break
+                
+                print(f"[INCID] Mensaje recibido: {message[:50]}...")
+                
+                # Procesar mensaje
+                response = self.process_message(message)
+                
+                # Enviar respuesta
+                client_socket.sendall(response.encode('utf-8'))
+                print(f"[INCID] Respuesta enviada: {response[:50]}...")
+                
+        except Exception as e:
+            print(f"[INCID] Error manejando cliente {address}: {e}")
+        finally:
+            client_socket.close()
+            print(f"[INCID] Conexión cerrada con {address}")
+    
+    def start(self):
+        """Iniciar servicio de incidencias"""
+        try:
+            self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            self.server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            self.server_socket.bind((self.host, self.port))
+            self.server_socket.listen(5)
+            
+            self.running = True
+            print(f"[INCID] Servicio de Incidencias iniciado en {self.host}:{self.port}")
+            
+            while self.running:
+                try:
+                    client_socket, address = self.server_socket.accept()
+                    client_thread = threading.Thread(
+                        target=self.handle_client,
+                        args=(client_socket, address)
+                    )
+                    client_thread.daemon = True
+                    client_thread.start()
+                    
+                except socket.error as e:
+                    if self.running:
+                        print(f"[INCID] Error aceptando conexión: {e}")
+                    
+        except Exception as e:
+            print(f"[INCID] Error iniciando servicio: {e}")
+        finally:
+            self.stop()
+    
+    def stop(self):
+        """Detener servicio de incidencias"""
+        self.running = False
+        if self.server_socket:
+            self.server_socket.close()
+        print("[INCID] Servicio de Incidencias detenido")
+
+def main():
+    """Función principal"""
+    service = IncidentService()
+    try:
+        service.start()
+    except KeyboardInterrupt:
+        print("\n[INCID] Deteniendo servicio...")
+        service.stop()
 
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=5006)
-
-
-
-
+    main()
