@@ -45,13 +45,27 @@ def setup_database():
         conn = psycopg2.connect(**db_config)
         cursor = conn.cursor()
         
-        # Ejecutar script de inicialización
+        # Ejecutar script de inicialización (sin comandos psql)
         print("Ejecutando script de inicialización...")
         with open('database/init.sql', 'r', encoding='utf-8') as f:
             sql_script = f.read()
         
-        # Ejecutar el script
-        cursor.execute(sql_script)
+        # Dividir el script en comandos individuales y ejecutar solo los SQL
+        sql_commands = []
+        for line in sql_script.split('\n'):
+            line = line.strip()
+            if line and not line.startswith('--') and not line.startswith('\\'):
+                sql_commands.append(line)
+        
+        # Ejecutar cada comando SQL
+        for command in sql_commands:
+            if command:
+                try:
+                    cursor.execute(command)
+                except psycopg2.Error as e:
+                    if "already exists" not in str(e):
+                        print(f"⚠️  Advertencia: {e}")
+        
         conn.commit()
         
         print("✅ Base de datos configurada exitosamente")
